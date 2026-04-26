@@ -9,6 +9,8 @@ class Player(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String(120), nullable=False, unique=True, index=True)
+    # Normalized last name stored for fast fuzzy-match queries
+    name_last = Column(String(60), nullable=True, index=True)
     tour = Column(String(3), nullable=False)          # ATP / WTA
     current_elo = Column(Float, nullable=True)
     peak_elo = Column(Float, nullable=True)
@@ -27,3 +29,9 @@ class Player(Base):
         """Return surface-specific ELO or fall back to overall ELO."""
         mapping = {"hard": self.elo_hard, "clay": self.elo_clay, "grass": self.elo_grass}
         return mapping.get(surface) or self.current_elo or 1500.0
+
+    def set_name(self, full_name: str) -> None:
+        """Set name and extract/store normalized last name for fast search."""
+        from app.utils.name_matcher import _last_name
+        self.name = full_name
+        self.name_last = _last_name(full_name)
