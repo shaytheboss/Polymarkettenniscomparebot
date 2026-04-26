@@ -1,0 +1,139 @@
+"""Telegram bot entry point and alert dispatcher."""
+from __future__ import annotations
+import asyncio
+import logging
+import signal
+
+from telegram import Bot
+from telegram.ext import Application, CommandHandler
+
+from app.config import settings
+from app.bot.handlers import (
+    cmd_start, cmd_status, cmd_live, cmd_opps,
+    cmd_settings, cmd_set_edge, cmd_set_tours,
+)
+from app.bot.formatters import fmt_opportunity
+
+logger = logging.getLogger(__name__)
+_app: Application | None = None
+
+
+def get_app() -> Application:
+    global _app
+    if _app is None:
+        _app = Application.builder().token(settings.telegram_bot_token).build()
+        _app.add_handler(CommandHandler("start", cmd_start))
+        _app.add_handler(CommandHandler("status", cmd_status))
+        _app.add_handler(CommandHandler("live", cmd_live))
+        _app.add_handler(CommandHandler("opps", cmd_opps))
+        _app.add_handler(CommandHandler("settings", cmd_settings))
+        _app.add_handler(CommandHandler("set_edge", cmd_set_edge))
+        _app.add_handler(CommandHandler("set_tours", cmd_set_tours))
+    return _app
+
+
+async def send_opportunity_alert(opportunity, match, db) -> None:
+    """Broadcast opportunity to all eligible subscribers."""
+    if not settings.telegram_bot_token:
+        return
+
+    from sqlalchemy import select
+    from app.models.alert import TelegramUser, Alert
+
+    p1_name = match.player1.name if match.player1 else "P1"
+    p2_name = match.player2.name if match.player2 else "P2"
+
+    text = fmt_opportunity(
+        match_name=f"{p1_name} vs {p2_name}",
+        score_text=opportunity.score_text or match.score_text or "?",
+        back_player=opportunity.back_player_name,
+        table_prob=opportunity.table_prob,
+        markov_prob=opportunity.markov_prob,
+        consensus_prob=opportunity.consensus_prob,
+        poly_price=opportunity.poly_price,
+        edge_pp=opportunity.edge_pp,
+        model_agreement=opportunity.model_agreement,
+        edge_category=opportunity.edge_category,
+        elo_band=(opportunity.extra or {}).get("elo_band", "?"),
+        surface=match.surface,
+        tournament=match.tournament or "",
+        notes=(opportunity.extra or {}).get("table_notes", ""),
+    )
+
+    users_result = await db.execute(
+        select(TelegramUser).where(TelegramUser.active == True)
+    )
+    users = users_result.scalars().all()
+
+    bot = Bot(token=settings.telegram_bot_token)
+    for user in users:
+        if user.min_edge_pp and opportunity.edge_pp < user.min_edge_pp:
+            continue
+        if user.tours_watched and match.tour not in user.tours_watched:
+            continue
+        try:
+            msg = await bot.send_message(
+                chat_id=user.chat_id,
+                text=text,
+                parse_mode="MarkdownV2",
+            )
+            alert = Alert(
+                opportunity_id=opportunity.id,
+                user_id=user.id,
+                message_text=text,
+                telegram_message_id=msg.message_id,
+                alert_type="OPPORTUNITY",
+            )
+            db.add(alert)
+        except Exception as e:
+            logger.error(f"Failed to send alert to {user.chat_id}: {e}")
+
+    opportunity.alert_sent = True
+    from datetime import datetime, timezone
+    opportunity.alert_sent_at = datetime.now(timezone.utc)
+    await db.commit()
+
+
+async def main():
+    if not settings.telegram_bot_token:
+        logger.error("TELEGRAM_BOT_TOKEN not set")
+        return
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    app = get_app()
+    stop_event = asyncio.Event()
+
+    def _stop(sig, frame):
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    if settings.is_production:
+        await app.initialize()
+        await app.start()
+        await app.updater.start_webhook(
+            listen="0.0.0.0",
+            port=8443,
+            url_path=f"/telegram/webhook/{settings.telegram_webhook_secret}",
+            secret_token=settings.telegram_webhook_secret,
+        )
+        await stop_event.wait()
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+    else:
+        async with app:
+            await app.start()
+            await app.updater.start_polling(drop_pending_updates=True)
+            await stop_event.wait()
+            await app.updater.stop()
+            await app.stop()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

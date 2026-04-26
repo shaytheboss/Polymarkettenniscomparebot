@@ -1,0 +1,27 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: tennisbot
+      POSTGRES_PASSWORD: tennisbot
+      POSTGRES_DB: tennisbot
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://tennisbot:tennisbot@db:5432/tennisbot
+    depends_on:
+      - db
+
+volumes:
+  pgdata:
