@@ -105,4 +105,23 @@ app.include_router(settings_api.router, prefix="/api/settings", tags=["settings"
 # Serve React dashboard build in production
 dashboard_dist = os.path.join(os.path.dirname(__file__), "..", "dashboard", "dist")
 if os.path.isdir(dashboard_dist):
-    app.mount("/", StaticFiles(directory=dashboard_dist, html=True), name="dashboard")
+    from fastapi import HTTPException
+    from fastapi.responses import FileResponse
+
+    # Mount the assets directory so JS/CSS bundles are served directly
+    _assets = os.path.join(dashboard_dist, "assets")
+    if os.path.isdir(_assets):
+        app.mount("/assets", StaticFiles(directory=_assets), name="assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def serve_spa(full_path: str = ""):
+        # Serve exact files that live in the dist root (favicon, etc.)
+        candidate = os.path.realpath(os.path.join(dashboard_dist, full_path))
+        dist_root = os.path.realpath(dashboard_dist)
+        if candidate.startswith(dist_root) and os.path.isfile(candidate):
+            return FileResponse(candidate)
+        # SPA fallback: always serve index.html for unknown paths
+        index = os.path.join(dashboard_dist, "index.html")
+        if os.path.isfile(index):
+            return FileResponse(index)
+        raise HTTPException(status_code=404)

@@ -9,7 +9,7 @@ from app.models.match import Match, MatchSnapshot
 router = APIRouter()
 
 
-@router.get("/")
+@router.get("")
 async def list_matches(
     status: Optional[str] = Query(None),
     tour: Optional[str] = Query(None),

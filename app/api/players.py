@@ -9,7 +9,7 @@ from app.models.player import Player
 router = APIRouter()
 
 
-@router.get("/")
+@router.get("")
 async def list_players(
     tour: Optional[str] = Query(None),
     search: Optional[str] = Query(None),

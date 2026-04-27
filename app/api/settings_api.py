@@ -14,7 +14,7 @@ class SettingUpdate(BaseModel):
     value: str
 
 
-@router.get("/")
+@router.get("")
 async def get_settings(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(BotSettings))
     settings_list = result.scalars().all()

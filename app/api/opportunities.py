@@ -11,7 +11,7 @@ from app.models.match import Match
 router = APIRouter()
 
 
-@router.get("/")
+@router.get("")
 async def list_opportunities(
     category: Optional[str] = Query(None),   # STRONG / MODERATE / WEAK
     tour: Optional[str] = Query(None),
@@ -46,26 +46,24 @@ async def list_opportunities(
 
 @router.get("/stats")
 async def opportunity_stats(db: AsyncSession = Depends(get_db)):
-    total = await db.execute(select(func.count()).select_from(Opportunity))
-    resolved = await db.execute(
+    total_n   = (await db.execute(select(func.count()).select_from(Opportunity))).scalar() or 0
+    resolved_n = (await db.execute(
         select(func.count()).select_from(Opportunity).where(Opportunity.resolved == True)
-    )
-    wins = await db.execute(
+    )).scalar() or 0
+    wins_n = (await db.execute(
         select(func.count()).select_from(Opportunity).where(Opportunity.outcome == "WIN")
-    )
-    losses = await db.execute(
+    )).scalar() or 0
+    losses_n = (await db.execute(
         select(func.count()).select_from(Opportunity).where(Opportunity.outcome == "LOSS")
-    )
-    avg_edge = await db.execute(select(func.avg(Opportunity.edge_pp)))
+    )).scalar() or 0
+    avg_edge_v = (await db.execute(select(func.avg(Opportunity.edge_pp)))).scalar() or 0
     return {
-        "total": total.scalar() or 0,
-        "resolved": resolved.scalar() or 0,
-        "wins": wins.scalar() or 0,
-        "losses": losses.scalar() or 0,
-        "win_rate": round(
-            (wins.scalar() or 0) / max(1, (wins.scalar() or 0) + (losses.scalar() or 0)), 3
-        ),
-        "avg_edge_pp": round(float(avg_edge.scalar() or 0), 2),
+        "total": total_n,
+        "resolved": resolved_n,
+        "wins": wins_n,
+        "losses": losses_n,
+        "win_rate": round(wins_n / max(1, wins_n + losses_n), 3),
+        "avg_edge_pp": round(float(avg_edge_v), 2),
     }
 
 
