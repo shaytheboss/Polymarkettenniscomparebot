@@ -12,11 +12,18 @@ from app.models.alert import TelegramUser, BotSettings
 from app.models.match import Match, MatchSnapshot
 from app.models.opportunity import Opportunity
 from app.models.player import Player
+from app.config import settings
 from app.bot.formatters import (
     fmt_status, fmt_match_prob, fmt_opps_list, fmt_help
 )
 
 logger = logging.getLogger(__name__)
+
+_DEFAULTS = {
+    "min_edge_pp":      settings.default_min_edge_pp,
+    "max_model_gap_pp": settings.default_max_model_gap_pp,
+    "alert_dedup_min":  settings.alert_dedup_minutes,
+}
 
 
 async def _get_or_create_user(chat_id: int, username: str, db) -> TelegramUser:
@@ -170,11 +177,17 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         user = await _get_or_create_user(chat_id, "", db)
 
     tours_str = ", ".join(user.tours_watched) if user.tours_watched else "הכל"
+    edge_marker    = "" if user.min_edge_pp    == _DEFAULTS["min_edge_pp"]    else " ✏️"
+    gap_marker     = "" if user.min_model_agreement == _DEFAULTS["max_model_gap_pp"] else " ✏️"
     await update.message.reply_text(
         f"*הגדרות שלך*\n\n"
-        f"פער מינימלי להתראה: `{user.min_edge_pp}pp`\n"
-        f"פער מקסימלי בין מודלים: `{user.min_model_agreement}pp`\n"
+        f"פער מינימלי להתראה: `{user.min_edge_pp}pp`{edge_marker}\n"
+        f"פער מקסימלי בין מודלים: `{user.min_model_agreement}pp`{gap_marker}\n"
         f"טורים: `{tours_str}`\n\n"
+        f"*ברירות מחדל של המערכת:*\n"
+        f"  edge ≥ `{_DEFAULTS['min_edge_pp']}pp` "
+        f"\\| model gap ≤ `{_DEFAULTS['max_model_gap_pp']}pp` "
+        f"\\| dedup `{_DEFAULTS['alert_dedup_min']}min`\n\n"
         f"שינוי:\n"
         f"/set\\_edge 8 — פער מינימלי\n"
         f"/set\\_tours ATP — ATP / WTA / ALL",
@@ -220,55 +233,76 @@ async def cmd_set_tours(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Force-fetch ESPN right now and show what's found."""
+    """Force-fetch all sources now and show full diagnostic output."""
     from app.collectors.tennis_live import fetch_all_today
-    await update.message.reply_text("מריץ סריקה...")
+    await update.message.reply_text(
+        f"מריץ סריקה מלאה (Sofascore → ESPN → TheSportsDB)...\n"
+        f"ברירות מחדל: edge≥{_DEFAULTS['min_edge_pp']}pp | "
+        f"model_gap≤{_DEFAULTS['max_model_gap_pp']}pp | "
+        f"dedup={_DEFAULTS['alert_dedup_min']}min"
+    )
     try:
         all_matches = await fetch_all_today()
     except Exception as exc:
         await update.message.reply_text(f"שגיאה: {exc}")
         return
 
-    live = [m for m in all_matches if m["status"] == "live"]
+    live      = [m for m in all_matches if m["status"] == "live"]
     scheduled = [m for m in all_matches if m["status"] == "scheduled"]
-    finished = [m for m in all_matches if m["status"] == "finished"]
+    finished  = [m for m in all_matches if m["status"] == "finished"]
 
     if not all_matches:
         await update.message.reply_text(
-            "ESPN החזיר 0 אירועים היום.\n"
-            "ייתכן שאין טורנירים פעילים ב-ESPN כרגע, "
-            "או שהמשחקים לא התחילו עדיין."
+            "⚠️ כל 3 המקורות החזירו 0 משחקים היום.\n"
+            "• Sofascore: 403 (Cloudflare חוסם IPs של Railway)\n"
+            "• ESPN: מחזיר מיכלי טורניר בלי משחקים בודדים\n"
+            "• TheSportsDB: גם כן ריק\n"
+            "בדוק שיש משחקים בפועל ב-tennisabstract.com"
         )
         return
 
     lines = [
-        f"ESPN היום: {len(all_matches)} משחקים",
+        f"✅ סריקה הצליחה: {len(all_matches)} משחקים",
         f"🟢 חיים: {len(live)}  🕐 מתוכננים: {len(scheduled)}  ✅ סיום: {len(finished)}",
         "",
     ]
-    for m in (live + scheduled)[:8]:
-        icon = "🟢" if m["status"] == "live" else "🕐"
-        score = m.get("score_text") or ""
-        lines.append(f"{icon} {m['player1_name']} vs {m['player2_name']} ({m['tour']})")
-        if score:
-            lines.append(f"   {score}")
 
-    if len(all_matches) > 8:
-        lines.append(f"... ועוד {len(all_matches) - 8} משחקים")
+    # Show all matches, grouped by status
+    shown = 0
+    for m in (live + scheduled + finished):
+        if shown >= 12:
+            lines.append(f"... ועוד {len(all_matches) - shown} משחקים")
+            break
+        icon = {"live": "🟢", "scheduled": "🕐", "finished": "✅"}.get(m["status"], "❓")
+        score = m.get("score_text") or "לא התחיל"
+        src = m["external_id"].split("_")[0].upper()
+        lines.append(
+            f"{icon} [{src}] {m['player1_name']} vs {m['player2_name']} "
+            f"({m['tour']} | {m['surface']})"
+        )
+        if score and score != "לא התחיל":
+            lines.append(f"   ניקוד: {score}")
+        shown += 1
 
-    # Also show DB state
+    # DB state
     async with AsyncSessionLocal() as db:
         db_live = (await db.execute(
             select(func.count()).select_from(Match).where(Match.status == "live")
         )).scalar() or 0
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        db_total = (await db.execute(
+            select(func.count()).select_from(Match)
+            .where(Match.updated_at >= today_start)
+        )).scalar() or 0
         db_opps = (await db.execute(
             select(func.count()).select_from(Opportunity)
-            .where(Opportunity.detected_at >= datetime.now(timezone.utc).replace(
-                hour=0, minute=0, second=0, microsecond=0
-            ))
+            .where(Opportunity.detected_at >= today_start)
         )).scalar() or 0
 
-    lines += ["", f"DB: {db_live} חיים, {db_opps} הזדמנויות היום"]
+    lines += [
+        "",
+        f"📊 DB: {db_live} חיים | {db_total} עודכנו היום | {db_opps} הזדמנויות",
+    ]
     await update.message.reply_text("\n".join(lines))
 
 

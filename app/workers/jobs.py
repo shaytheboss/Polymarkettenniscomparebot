@@ -28,14 +28,56 @@ from app.bot.telegram_bot import send_opportunity_alert
 
 logger = logging.getLogger(__name__)
 
+# System-wide alert defaults (from settings, displayed at startup and in heartbeat)
+from app.config import settings
+_DEFAULTS = {
+    "min_edge_pp":        settings.default_min_edge_pp,
+    "max_model_gap_pp":   settings.default_max_model_gap_pp,
+    "alert_dedup_min":    settings.alert_dedup_minutes,
+    "live_scores_sec":    settings.live_scores_interval,
+    "polymarket_sec":     settings.polymarket_interval,
+    "analyzer_sec":       settings.analyzer_interval,
+}
+
 
 # ---------------------------------------------------------------------------
 # Live scores
 # ---------------------------------------------------------------------------
 
 async def job_heartbeat():
-    """Log a heartbeat so we can confirm the scheduler is alive."""
-    logger.info("Heartbeat — scheduler alive")
+    """Log a comprehensive status heartbeat every 5 minutes."""
+    from sqlalchemy import func
+    from app.models.opportunity import Opportunity
+
+    async with AsyncSessionLocal() as db:
+        try:
+            live_n = (await db.execute(
+                select(func.count()).select_from(Match).where(Match.status == "live")
+            )).scalar() or 0
+            today_start = datetime.now(timezone.utc).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            opps_n = (await db.execute(
+                select(func.count()).select_from(Opportunity)
+                .where(Opportunity.detected_at >= today_start)
+            )).scalar() or 0
+            atp_players = (await db.execute(
+                select(func.count()).select_from(Player).where(Player.tour == "ATP")
+            )).scalar() or 0
+            wta_players = (await db.execute(
+                select(func.count()).select_from(Player).where(Player.tour == "WTA")
+            )).scalar() or 0
+        except Exception as e:
+            logger.error(f"Heartbeat DB query failed: {e}")
+            live_n = opps_n = atp_players = wta_players = -1
+
+    logger.info(
+        f"[HEARTBEAT] live_matches={live_n} | opps_today={opps_n} "
+        f"| players=ATP:{atp_players}/WTA:{wta_players} "
+        f"| defaults: edge≥{_DEFAULTS['min_edge_pp']}pp "
+        f"model_gap≤{_DEFAULTS['max_model_gap_pp']}pp "
+        f"dedup={_DEFAULTS['alert_dedup_min']}min"
+    )
 
 
 async def job_fetch_live_scores():
@@ -47,13 +89,20 @@ async def job_fetch_live_scores():
 
 
 async def _job_fetch_live_scores_inner():
-    # Fetch all of today's matches (live + scheduled + finished) so the DB
-    # gets populated even when there are no live games right now.
     raw_matches = await fetch_all_today()
     if not raw_matches:
-        logger.warning("fetch_all_today returned 0 matches")
+        logger.warning("fetch_all_today returned 0 matches — all three sources failed")
         return
 
+    by_status: dict[str, int] = {}
+    for m in raw_matches:
+        by_status[m["status"]] = by_status.get(m["status"], 0) + 1
+    logger.info(
+        f"fetch_all_today: {len(raw_matches)} matches — "
+        + " | ".join(f"{k}:{v}" for k, v in sorted(by_status.items()))
+    )
+
+    new_count = updated_count = 0
     async with AsyncSessionLocal() as db:
         for raw in raw_matches:
             ext_id = raw["external_id"]
@@ -76,20 +125,28 @@ async def _job_fetch_live_scores_inner():
                 )
                 db.add(match)
                 await db.flush()
+                logger.info(
+                    f"NEW match: {raw['player1_name']} vs {raw['player2_name']} "
+                    f"[{raw['tour']} | {raw['surface']} | {raw.get('tournament','')}] "
+                    f"status={raw['status']}"
+                )
+                new_count += 1
+            else:
+                updated_count += 1
 
-            # Always refresh score
-            match.status     = raw["status"]
-            match.p1_sets    = raw["p1_sets"]
-            match.p2_sets    = raw["p2_sets"]
-            match.p1_games   = raw["p1_games"]
-            match.p2_games   = raw["p2_games"]
-            match.p1_pts     = raw["p1_pts"]
-            match.p2_pts     = raw["p2_pts"]
-            match.server     = raw["server"]
+            match.status      = raw["status"]
+            match.p1_sets     = raw["p1_sets"]
+            match.p2_sets     = raw["p2_sets"]
+            match.p1_games    = raw["p1_games"]
+            match.p2_games    = raw["p2_games"]
+            match.p1_pts      = raw["p1_pts"]
+            match.p2_pts      = raw["p2_pts"]
+            match.server      = raw["server"]
             match.in_tiebreak = raw["in_tiebreak"]
-            match.score_text = raw.get("score_text", "")
+            match.score_text  = raw.get("score_text", "")
 
         await db.commit()
+    logger.info(f"DB upsert complete: {new_count} new, {updated_count} updated")
 
 
 # ---------------------------------------------------------------------------
