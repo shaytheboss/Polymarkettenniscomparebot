@@ -127,6 +127,12 @@ def _parse_espn_event(event: dict, tour: str) -> Optional[dict]:
     p1_name = get_name(c1)
     p2_name = get_name(c2)
 
+    def _safe_int(v) -> int:
+        try:
+            return int(v or 0)
+        except (TypeError, ValueError):
+            return 0
+
     # Set scores from linescores
     p1_linescores = [ls.get("value", 0) for ls in (c1.get("linescores") or [])]
     p2_linescores = [ls.get("value", 0) for ls in (c2.get("linescores") or [])]
@@ -137,8 +143,8 @@ def _parse_espn_event(event: dict, tour: str) -> Optional[dict]:
 
     num_sets = max(len(p1_linescores), len(p2_linescores))
     for i in range(num_sets):
-        g1 = int(p1_linescores[i]) if i < len(p1_linescores) else 0
-        g2 = int(p2_linescores[i]) if i < len(p2_linescores) else 0
+        g1 = _safe_int(p1_linescores[i]) if i < len(p1_linescores) else 0
+        g2 = _safe_int(p2_linescores[i]) if i < len(p2_linescores) else 0
         # Determine if this set is finished or ongoing
         set_done = _is_set_complete(g1, g2, status)
         if set_done:
@@ -188,8 +194,8 @@ def _parse_espn_event(event: dict, tour: str) -> Optional[dict]:
     # Score text
     score_parts = []
     for i in range(max(len(p1_linescores), len(p2_linescores))):
-        g1 = int(p1_linescores[i]) if i < len(p1_linescores) else 0
-        g2 = int(p2_linescores[i]) if i < len(p2_linescores) else 0
+        g1 = _safe_int(p1_linescores[i]) if i < len(p1_linescores) else 0
+        g2 = _safe_int(p2_linescores[i]) if i < len(p2_linescores) else 0
         score_parts.append(f"{g1}-{g2}")
     score_text = ", ".join(score_parts)
 

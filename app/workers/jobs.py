@@ -33,8 +33,20 @@ logger = logging.getLogger(__name__)
 # Live scores
 # ---------------------------------------------------------------------------
 
+async def job_heartbeat():
+    """Log a heartbeat so we can confirm the scheduler is alive."""
+    logger.info("Heartbeat — scheduler alive")
+
+
 async def job_fetch_live_scores():
     """Poll ESPN live scores and upsert match records."""
+    try:
+        await _job_fetch_live_scores_inner()
+    except Exception as exc:
+        logger.error(f"job_fetch_live_scores unhandled: {exc}", exc_info=True)
+
+
+async def _job_fetch_live_scores_inner():
     raw_matches = await fetch_live_matches()
     if not raw_matches:
         return

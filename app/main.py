@@ -1,11 +1,12 @@
+import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 
 import sentry_sdk
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-import os
 
 from app.config import settings
 from app.api import health, matches, opportunities, players, settings_api
@@ -16,6 +17,21 @@ if settings.sentry_dsn:
     sentry_sdk.init(dsn=settings.sentry_dsn, environment=settings.app_env)
 
 logger = logging.getLogger(__name__)
+
+
+async def _keepalive_task():
+    """Ping own /health every 14 min to prevent Railway free-tier sleep."""
+    import httpx
+    port = int(os.environ.get("PORT", 8000))
+    url = f"http://localhost:{port}/health"
+    await asyncio.sleep(60)  # wait for startup
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                await client.get(url)
+        except Exception:
+            pass
+        await asyncio.sleep(14 * 60)
 
 
 @asynccontextmanager
@@ -30,10 +46,37 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     logger.info("Scheduler started")
 
+    # Keep Railway free tier awake
+    keepalive = asyncio.create_task(_keepalive_task())
+
+    # Start Telegram bot polling (receives /start, /live, etc.)
+    tg_app = None
+    if settings.telegram_bot_token:
+        try:
+            from app.bot.telegram_bot import get_app as get_tg_app
+            tg_app = get_tg_app()
+            await tg_app.initialize()
+            await tg_app.start()
+            await tg_app.updater.start_polling(drop_pending_updates=True)
+            logger.info("Telegram bot polling started")
+        except Exception as exc:
+            logger.error(f"Telegram bot failed to start: {exc}", exc_info=True)
+            tg_app = None
+
     # Run ELO refresh on startup if never done
     await job_refresh_elo()
 
     yield
+
+    keepalive.cancel()
+
+    if tg_app:
+        try:
+            await tg_app.updater.stop()
+            await tg_app.stop()
+            await tg_app.shutdown()
+        except Exception:
+            pass
 
     scheduler.shutdown(wait=False)
     logger.info("Shutting down")
