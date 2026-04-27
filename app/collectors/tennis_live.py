@@ -9,6 +9,7 @@ Point-level data (current game score) is parsed from statusClock / situation
 fields where available; otherwise defaults to 0-0.
 """
 from __future__ import annotations
+import datetime
 import logging
 from typing import Optional
 
@@ -16,8 +17,21 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-ESPN_ATP = "https://site.api.espn.com/apis/site/v2/sports/tennis/atp/scoreboard"
-ESPN_WTA = "https://site.api.espn.com/apis/site/v2/sports/tennis/wta/scoreboard"
+_ESPN_ATP_BASE = "https://site.api.espn.com/apis/site/v2/sports/tennis/atp/scoreboard"
+_ESPN_WTA_BASE = "https://site.api.espn.com/apis/site/v2/sports/tennis/wta/scoreboard"
+
+# Keep bare constants for backward-compat imports
+ESPN_ATP = _ESPN_ATP_BASE
+ESPN_WTA = _ESPN_WTA_BASE
+
+
+def _today_espn_urls() -> tuple[str, str]:
+    """Return ESPN scoreboard URLs with today's date for better coverage."""
+    today = datetime.date.today().strftime("%Y%m%d")
+    return (
+        f"{_ESPN_ATP_BASE}?dates={today}",
+        f"{_ESPN_WTA_BASE}?dates={today}",
+    )
 
 _HEADERS = {
     "User-Agent": (
@@ -250,6 +264,15 @@ async def _fetch_espn(url: str, tour: str) -> list[dict]:
         return []
 
     events = data.get("events") or []
+    if not events:
+        logger.warning(f"ESPN {tour}: 0 events from {url}")
+    else:
+        statuses = list({
+            (e.get("status") or {}).get("type", {}).get("name", "?")
+            for e in events
+        })
+        logger.info(f"ESPN {tour}: {len(events)} events, statuses={statuses}")
+
     results = []
     for event in events:
         try:
@@ -257,7 +280,7 @@ async def _fetch_espn(url: str, tour: str) -> list[dict]:
             if parsed:
                 results.append(parsed)
         except Exception as e:
-            logger.debug(f"Failed to parse ESPN event {event.get('id')}: {e}")
+            logger.warning(f"Failed to parse ESPN event {event.get('id')}: {e}")
 
     return results
 
@@ -268,21 +291,32 @@ async def fetch_live_matches() -> list[dict]:
     Returns normalized match dicts.
     """
     import asyncio
+    atp_url, wta_url = _today_espn_urls()
     atp, wta = await asyncio.gather(
-        _fetch_espn(ESPN_ATP, "ATP"),
-        _fetch_espn(ESPN_WTA, "WTA"),
+        _fetch_espn(atp_url, "ATP"),
+        _fetch_espn(wta_url, "WTA"),
     )
     all_matches = atp + wta
     live = [m for m in all_matches if m["status"] == "live"]
-    logger.info(f"ESPN: {len(live)} live matches ({len(atp)} ATP, {len(wta)} WTA fetched)")
+    logger.info(
+        f"ESPN: {len(live)} live / {len(all_matches)} total "
+        f"({len(atp)} ATP, {len(wta)} WTA)"
+    )
     return live
+
+
+async def fetch_all_today() -> list[dict]:
+    """Fetch ALL of today's matches (any status) for the /refresh command."""
+    import asyncio
+    atp_url, wta_url = _today_espn_urls()
+    atp, wta = await asyncio.gather(
+        _fetch_espn(atp_url, "ATP"),
+        _fetch_espn(wta_url, "WTA"),
+    )
+    return atp + wta
 
 
 async def fetch_upcoming_matches() -> list[dict]:
     """Fetch today's scheduled matches (for pre-loading players)."""
-    import asyncio
-    atp, wta = await asyncio.gather(
-        _fetch_espn(ESPN_ATP, "ATP"),
-        _fetch_espn(ESPN_WTA, "WTA"),
-    )
-    return [m for m in (atp + wta) if m["status"] in ("scheduled", "live")]
+    all_today = await fetch_all_today()
+    return [m for m in all_today if m["status"] in ("scheduled", "live")]

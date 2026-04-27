@@ -217,3 +217,93 @@ async def cmd_set_tours(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await db.commit()
     label = val if val != "ALL" else "הכל"
     await update.message.reply_text(f"✅ טורים: `{label}`", parse_mode="MarkdownV2")
+
+
+async def cmd_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Force-fetch ESPN right now and show what's found."""
+    from app.collectors.tennis_live import fetch_all_today
+    await update.message.reply_text("מריץ סריקה...")
+    try:
+        all_matches = await fetch_all_today()
+    except Exception as exc:
+        await update.message.reply_text(f"שגיאה: {exc}")
+        return
+
+    live = [m for m in all_matches if m["status"] == "live"]
+    scheduled = [m for m in all_matches if m["status"] == "scheduled"]
+    finished = [m for m in all_matches if m["status"] == "finished"]
+
+    if not all_matches:
+        await update.message.reply_text(
+            "ESPN החזיר 0 אירועים היום.\n"
+            "ייתכן שאין טורנירים פעילים ב-ESPN כרגע, "
+            "או שהמשחקים לא התחילו עדיין."
+        )
+        return
+
+    lines = [
+        f"ESPN היום: {len(all_matches)} משחקים",
+        f"🟢 חיים: {len(live)}  🕐 מתוכננים: {len(scheduled)}  ✅ סיום: {len(finished)}",
+        "",
+    ]
+    for m in (live + scheduled)[:8]:
+        icon = "🟢" if m["status"] == "live" else "🕐"
+        score = m.get("score_text") or ""
+        lines.append(f"{icon} {m['player1_name']} vs {m['player2_name']} ({m['tour']})")
+        if score:
+            lines.append(f"   {score}")
+
+    if len(all_matches) > 8:
+        lines.append(f"... ועוד {len(all_matches) - 8} משחקים")
+
+    # Also show DB state
+    async with AsyncSessionLocal() as db:
+        db_live = (await db.execute(
+            select(func.count()).select_from(Match).where(Match.status == "live")
+        )).scalar() or 0
+        db_opps = (await db.execute(
+            select(func.count()).select_from(Opportunity)
+            .where(Opportunity.detected_at >= datetime.now(timezone.utc).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ))
+        )).scalar() or 0
+
+    lines += ["", f"DB: {db_live} חיים, {db_opps} הזדמנויות היום"]
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_track(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Search ESPN for a player and show their current match details."""
+    query = " ".join(ctx.args).strip() if ctx.args else ""
+    if not query:
+        await update.message.reply_text(
+            "שימוש: /track שם\\_שחקן\nדוגמה: /track Alcaraz",
+            parse_mode="MarkdownV2",
+        )
+        return
+
+    from app.collectors.tennis_live import fetch_all_today
+    all_matches = await fetch_all_today()
+
+    ql = query.lower()
+    found = [
+        m for m in all_matches
+        if ql in m["player1_name"].lower() or ql in m["player2_name"].lower()
+    ]
+
+    if not found:
+        await update.message.reply_text(
+            f"לא נמצא '{query}' ב-ESPN.\n"
+            f"ESPN מציג {len(all_matches)} אירועים היום."
+        )
+        return
+
+    for m in found[:3]:
+        icon = {"live": "🟢", "finished": "✅", "scheduled": "🕐"}.get(m["status"], "❓")
+        score = m.get("score_text") or "לא התחיל"
+        await update.message.reply_text(
+            f"{icon} {m['player1_name']} vs {m['player2_name']}\n"
+            f"טור: {m['tour']} | מגרש: {m['surface']}\n"
+            f"ניקוד: {score}\n"
+            f"סטטוס: {m['status']}"
+        )

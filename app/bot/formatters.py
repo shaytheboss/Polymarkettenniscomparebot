@@ -232,6 +232,8 @@ def fmt_help() -> str:
         "/settings — הגדרות התראות שלך\n"
         "/set\\_edge 8 — פער מינימלי לקבלת התראה \\(pp\\)\n"
         "/set\\_tours ATP — סינון ATP/WTA/ALL\n"
+        "/refresh — סריקה מיידית של ESPN\n"
+        "/track שם — חפש שחקן ב\\-ESPN\n"
         "/help — הודעה זו\n\n"
         "*מה הבוט עושה:*\n"
         "• עוקב אחרי משחקי ATP/WTA חיים דרך ESPN\n"

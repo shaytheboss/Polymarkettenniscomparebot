@@ -11,6 +11,7 @@ from app.config import settings
 from app.bot.handlers import (
     cmd_start, cmd_help, cmd_status, cmd_live,
     cmd_opps, cmd_settings, cmd_set_edge, cmd_set_tours,
+    cmd_refresh, cmd_track,
 )
 from app.bot.formatters import fmt_opportunity
 
@@ -30,6 +31,8 @@ def get_app() -> Application:
         _app.add_handler(CommandHandler("settings",   cmd_settings))
         _app.add_handler(CommandHandler("set_edge",   cmd_set_edge))
         _app.add_handler(CommandHandler("set_tours",  cmd_set_tours))
+        _app.add_handler(CommandHandler("refresh",    cmd_refresh))
+        _app.add_handler(CommandHandler("track",      cmd_track))
     return _app
 
 
