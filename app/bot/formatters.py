@@ -38,6 +38,7 @@ def fmt_opportunity(
     p2_sets: int = 0,
     p1_games: int = 0,
     p2_games: int = 0,
+    polymarket_url: str = "",
 ) -> str:
     cat_emoji = {"STRONG": "🔴", "MODERATE": "🟡", "WEAK": "🟢"}.get(edge_category, "⚪")
     surface_emoji = {"hard": "🔵", "clay": "🟤", "grass": "🟢"}.get(surface, "⚫")
@@ -106,6 +107,15 @@ def fmt_opportunity(
         f"  \\(מחושב על בסיס edge ומחיר Poly\\)",
         f"",
         f"⏰ {_esc(now)}",
+    ]
+
+    if polymarket_url:
+        lines += [
+            f"",
+            f"🔗 [פתח ב\\-Polymarket]({polymarket_url})",
+        ]
+
+    lines += [
         f"",
         f"⚠️ _בסיס סטטיסטי בלבד\\. לא המלצת השקעה\\._",
         f"_בדוק פציעה / משטח / ELO אמיתי לפני פעולה\\._",

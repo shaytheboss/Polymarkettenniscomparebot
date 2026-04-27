@@ -57,6 +57,9 @@ async def lifespan(app: FastAPI):
             tg_app = get_tg_app()
             await tg_app.initialize()
             await tg_app.start()
+            # Brief delay so a previous Railway instance's polling fully stops
+            # before we start, avoiding 409 Conflict errors on rolling deploys.
+            await asyncio.sleep(4)
             await tg_app.updater.start_polling(drop_pending_updates=True)
             logger.info("Telegram bot polling started")
         except Exception as exc:

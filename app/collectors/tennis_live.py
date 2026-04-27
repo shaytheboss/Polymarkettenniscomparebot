@@ -58,12 +58,23 @@ _ESPN_HEADERS = {
 }
 
 _ESPN_STATUS = {
+    # Live states
     "STATUS_IN_PROGRESS": "live",
     "STATUS_HALFTIME":    "live",
     "STATUS_DELAYED":     "live",
-    "STATUS_SCHEDULED":   "scheduled",
+    "STATUS_SUSPENDED":   "live",
+    "STATUS_RAIN_DELAY":  "live",
+    # Finished states (including retirement / walkover)
     "STATUS_FINAL":       "finished",
     "STATUS_FINAL_OT":    "finished",
+    "STATUS_RETIRED":     "finished",
+    "STATUS_WALKOVER":    "finished",
+    "STATUS_ABANDONED":   "finished",
+    # Scheduled / not-yet-started states
+    "STATUS_SCHEDULED":   "scheduled",
+    "STATUS_POSTPONED":   "scheduled",
+    "STATUS_CANCELLED":   "scheduled",
+    "STATUS_FORFEIT":     "finished",
 }
 
 _POINT_MAP = {

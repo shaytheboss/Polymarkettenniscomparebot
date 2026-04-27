@@ -54,6 +54,15 @@ async def send_opportunity_alert(opportunity, match, db) -> None:
 
     extra = opportunity.extra or {}
 
+    # Construct Polymarket search URL from player last names
+    from app.utils.name_matcher import _last_name
+    last1 = _last_name(p1_name).replace(" ", "+")
+    last2 = _last_name(p2_name).replace(" ", "+")
+    poly_url = f"https://polymarket.com/markets?search={last1}+{last2}"
+    if match.polymarket_condition_id:
+        # If we have a condition ID, also include it in the search for precision
+        poly_url = f"https://polymarket.com/markets?search={last1}+{last2}&tag=tennis"
+
     text = fmt_opportunity(
         match_name=f"{p1_name} vs {p2_name}",
         score_text=opportunity.score_text or match.score_text or "?",
@@ -75,6 +84,7 @@ async def send_opportunity_alert(opportunity, match, db) -> None:
         p2_sets=opportunity.p2_sets or 0,
         p1_games=opportunity.p1_games or 0,
         p2_games=opportunity.p2_games or 0,
+        polymarket_url=poly_url,
     )
 
     users_result = await db.execute(
