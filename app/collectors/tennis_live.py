@@ -278,6 +278,11 @@ def _parse_espn_match(event: dict, tour: str, parent_venue: dict = None,
                 break
 
     status_type = (status_obj.get("type") or {}).get("name", "STATUS_SCHEDULED")
+    if status_type not in _ESPN_STATUS:
+        logger.warning(
+            f"ESPN {tour} match {eid}: unknown status type '{status_type}' "
+            f"— defaulting to 'scheduled'. Add to _ESPN_STATUS if this is a live state."
+        )
     status = _ESPN_STATUS.get(status_type, "scheduled")
 
     if len(competitors) < 2:

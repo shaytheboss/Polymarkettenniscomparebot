@@ -40,13 +40,18 @@ _DEFAULTS = {
     "analyzer_sec":       settings.analyzer_interval,
 }
 
+_heartbeat_count = 0  # incremented each call; Telegram update every 6th (≈30 min)
+
 
 # ---------------------------------------------------------------------------
 # Live scores
 # ---------------------------------------------------------------------------
 
 async def job_heartbeat():
-    """Log a comprehensive status heartbeat every 5 minutes."""
+    """Log a status heartbeat every 5 minutes; send Telegram update every 30 minutes."""
+    global _heartbeat_count
+    _heartbeat_count += 1
+
     from sqlalchemy import func
     from app.models.opportunity import Opportunity
 
@@ -73,12 +78,29 @@ async def job_heartbeat():
             live_n = opps_n = atp_players = wta_players = -1
 
     logger.info(
-        f"[HEARTBEAT] live_matches={live_n} | opps_today={opps_n} "
+        f"[HEARTBEAT #{_heartbeat_count}] live_matches={live_n} | opps_today={opps_n} "
         f"| players=ATP:{atp_players}/WTA:{wta_players} "
         f"| defaults: edge≥{_DEFAULTS['min_edge_pp']}pp "
         f"model_gap≤{_DEFAULTS['max_model_gap_pp']}pp "
         f"dedup={_DEFAULTS['alert_dedup_min']}min"
     )
+
+    # Send Telegram status update every 6th heartbeat (≈30 minutes)
+    if _heartbeat_count % 6 == 0:
+        try:
+            from app.bot.telegram_bot import broadcast_message
+            ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
+            live_icon = "🟢" if live_n > 0 else "⚪"
+            msg = (
+                f"📡 סטטוס בוט [{ts}]\n"
+                f"{live_icon} משחקים חיים: {live_n}\n"
+                f"📊 הזדמנויות היום: {opps_n}\n"
+                f"👥 שחקנים: ATP {atp_players} | WTA {wta_players}\n"
+                f"⚙️ ספים: edge≥{_DEFAULTS['min_edge_pp']}pp | gap≤{_DEFAULTS['max_model_gap_pp']}pp"
+            )
+            asyncio.ensure_future(broadcast_message(msg))
+        except Exception as e:
+            logger.error(f"Heartbeat Telegram update failed: {e}")
 
 
 async def job_fetch_live_scores():
@@ -303,7 +325,8 @@ async def _resolve_player(name: str, tour: str, db) -> Player:
     """
     Find a Player record by name using fuzzy matching.
     Creates a new record with ELO=1500 if no match found.
-    Also refreshes ELO from match if player was just created.
+    Uses a savepoint to handle race conditions where the player was just inserted
+    (e.g. same player appears in multiple matches, or ESPN assigns wrong tour).
     """
     player = await find_player_by_name(name, tour, db, fuzzy_threshold=0.80)
     if player:
@@ -312,6 +335,20 @@ async def _resolve_player(name: str, tour: str, db) -> Player:
     # Not found — create a stub. ELO refresh will fill it in later.
     player = Player(name=name, tour=tour, current_elo=1500.0)
     db.add(player)
-    await db.flush()
-    logger.info(f"Created new player stub: {name} ({tour})")
-    return player
+    try:
+        async with db.begin_nested():  # savepoint — rollback only this INSERT on conflict
+            await db.flush()
+        logger.info(f"Created new player stub: {name} ({tour})")
+        return player
+    except Exception:
+        # Unique name constraint: player already exists (possibly with a different tour).
+        # ESPN sometimes assigns wrong tour (e.g. WTA player appearing in ATP data).
+        result = await db.execute(select(Player).where(Player.name == name))
+        existing = result.scalar_one_or_none()
+        if existing:
+            logger.debug(
+                f"Player '{name}' already in DB as {existing.tour} "
+                f"(requested {tour}) — reusing existing record"
+            )
+            return existing
+        raise
