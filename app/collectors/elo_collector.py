@@ -47,20 +47,46 @@ async def _fetch_elo_page(url: str) -> list[dict]:
         return []
 
     headers = [th.get_text(strip=True).lower() for th in rows_el[0].find_all(["th", "td"])]
+    logger.info(f"ELO table headers at {url}: {headers}")
 
-    def col_idx(candidates: list[str]) -> Optional[int]:
+    def col_idx_exact(candidates: list[str]) -> Optional[int]:
+        """Match a column whose header is EXACTLY one of the candidates."""
+        for i, h in enumerate(headers):
+            if h in candidates:
+                return i
+        return None
+
+    def col_idx_contains(candidates: list[str], excludes: list[str] = None) -> Optional[int]:
+        """Match first column whose header CONTAINS a candidate but not any exclude term."""
+        excl = excludes or []
         for cand in candidates:
             for i, h in enumerate(headers):
-                if cand in h:
+                if cand in h and not any(ex in h for ex in excl):
                     return i
         return None
 
-    name_idx  = col_idx(["player", "name"])
-    elo_idx   = col_idx(["elo", "overall"])
-    hard_idx  = col_idx(["hard"])
-    clay_idx  = col_idx(["clay"])
-    grass_idx = col_idx(["grass"])
-    rank_idx  = col_idx(["rank", "#"])
+    # Name column
+    name_idx = col_idx_exact(["player", "name"]) or col_idx_contains(["player", "name"])
+
+    # Overall ELO — must not be a surface-specific column
+    _surface_terms = ["hard", "clay", "grass", "carpet", "h.", "c.", "g."]
+    elo_idx = (
+        col_idx_exact(["elo", "overall elo", "overall"])
+        or col_idx_contains(["elo", "overall"], excludes=_surface_terms)
+    )
+
+    # Surface ELOs
+    hard_idx  = col_idx_contains(["hard"])
+    clay_idx  = col_idx_contains(["clay"])
+    grass_idx = col_idx_contains(["grass"])
+
+    # Ranking
+    rank_idx = col_idx_exact(["rank", "#", "rk", "ranking"]) or col_idx_contains(["rank", "rk"])
+
+    logger.info(
+        f"ELO column indices — name:{name_idx} elo:{elo_idx} "
+        f"hard:{hard_idx} clay:{clay_idx} grass:{grass_idx} rank:{rank_idx}"
+    )
 
     if name_idx is None or elo_idx is None:
         logger.warning(f"Cannot identify ELO columns. Headers: {headers}")
@@ -92,7 +118,8 @@ async def _fetch_elo_page(url: str) -> list[dict]:
 
         name = _clean_name(cells[name_idx]) if name_idx < len(cells) else ""
         elo  = safe_float(elo_idx)
-        if not name or not elo:
+        # Sanity check: realistic Elo range is 1200–2800
+        if not name or not elo or not (1200 <= elo <= 2800):
             continue
 
         rows.append({
