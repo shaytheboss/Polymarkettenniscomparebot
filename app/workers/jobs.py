@@ -20,7 +20,7 @@ from app.database import AsyncSessionLocal
 from app.models.match import Match
 from app.models.player import Player
 from app.models.alert import BotSettings
-from app.collectors.tennis_live import fetch_live_matches, fetch_upcoming_matches
+from app.collectors.tennis_live import fetch_all_today, fetch_upcoming_matches
 from app.collectors.elo_collector import refresh_elo, find_player_by_name
 from app.collectors.polymarket import fetch_match_price
 from app.analyzers.opportunity_detector import process_live_match
@@ -47,8 +47,11 @@ async def job_fetch_live_scores():
 
 
 async def _job_fetch_live_scores_inner():
-    raw_matches = await fetch_live_matches()
+    # Fetch all of today's matches (live + scheduled + finished) so the DB
+    # gets populated even when there are no live games right now.
+    raw_matches = await fetch_all_today()
     if not raw_matches:
+        logger.warning("fetch_all_today returned 0 matches")
         return
 
     async with AsyncSessionLocal() as db:

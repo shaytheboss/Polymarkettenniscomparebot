@@ -46,7 +46,11 @@ async def _fetch_elo_page(url: str) -> list[dict]:
     if not rows_el:
         return []
 
-    headers = [th.get_text(strip=True).lower() for th in rows_el[0].find_all(["th", "td"])]
+    # Normalize \xa0 (non-breaking space) → regular space before lower-casing
+    headers = [
+        th.get_text(strip=True).replace("\xa0", " ").lower()
+        for th in rows_el[0].find_all(["th", "td"])
+    ]
     logger.info(f"ELO table headers at {url}: {headers}")
 
     def col_idx_exact(candidates: list[str]) -> Optional[int]:
@@ -75,13 +79,19 @@ async def _fetch_elo_page(url: str) -> list[dict]:
         or col_idx_contains(["elo", "overall"], excludes=_surface_terms)
     )
 
-    # Surface ELOs
-    hard_idx  = col_idx_contains(["hard"])
-    clay_idx  = col_idx_contains(["clay"])
-    grass_idx = col_idx_contains(["grass"])
+    # Surface ELOs — Tennis Abstract uses "helo"/"celo"/"gelo" column names
+    # Try abbreviated forms first (exact), then fall back to substring search
+    hard_idx  = col_idx_exact(["helo", "hard elo", "hard"]) or col_idx_contains(["helo", "hardelo"])
+    clay_idx  = col_idx_exact(["celo", "clay elo", "clay"]) or col_idx_contains(["celo", "clayelo"])
+    grass_idx = col_idx_exact(["gelo", "grass elo", "grass"]) or col_idx_contains(["gelo", "grasselo"])
 
-    # Ranking
-    rank_idx = col_idx_exact(["rank", "#", "rk", "ranking"]) or col_idx_contains(["rank", "rk"])
+    # Ranking — prefer ATP/WTA rank column over ELO rank column
+    rank_idx = (
+        col_idx_exact(["atp rank", "wta rank", "atp", "wta"])
+        or col_idx_contains(["atp rank", "wta rank"])
+        or col_idx_exact(["rank", "#", "rk", "ranking"])
+        or col_idx_contains(["rank", "rk"], excludes=["elo"])
+    )
 
     logger.info(
         f"ELO column indices — name:{name_idx} elo:{elo_idx} "

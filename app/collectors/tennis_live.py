@@ -23,12 +23,19 @@ _SF_TODAY = "https://api.sofascore.com/api/v1/sport/tennis/scheduled-events/{dat
 
 _SF_HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
+        "Chrome/124.0.6367.82 Mobile Safari/537.36"
     ),
-    "Accept": "application/json",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://www.sofascore.com",
     "Referer": "https://www.sofascore.com/",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-site",
 }
 
 # ─── ESPN (fallback) ─────────────────────────────────────────────────────────
@@ -214,17 +221,21 @@ def _safe_int(v) -> int:
 
 
 def _parse_espn_event(event: dict, tour: str) -> Optional[dict]:
+    eid = event.get("id", "?")
     competitions = event.get("competitions") or []
     if not competitions:
+        logger.warning(f"ESPN event {eid}: no competitions key — skipping")
         return None
     comp = competitions[0]
 
     status_obj = comp.get("status") or event.get("status") or {}
     status_type = (status_obj.get("type") or {}).get("name", "STATUS_SCHEDULED")
     status = _ESPN_STATUS.get(status_type, "scheduled")
+    logger.info(f"ESPN event {eid}: raw_status={status_type} → {status}")
 
     competitors = comp.get("competitors") or []
     if len(competitors) < 2:
+        logger.warning(f"ESPN event {eid}: only {len(competitors)} competitor(s) — skipping")
         return None
     c1, c2 = competitors[0], competitors[1]
 
@@ -316,6 +327,11 @@ async def _fetch_espn(url: str, tour: str) -> list[dict]:
             parsed = _parse_espn_event(ev, tour)
             if parsed:
                 results.append(parsed)
+            else:
+                logger.warning(
+                    f"ESPN {tour} event {ev.get('id','?')} returned None — "
+                    f"keys={list(ev.keys())}"
+                )
         except Exception as exc:
             logger.warning(f"Failed to parse ESPN event {ev.get('id')}: {exc}")
 
