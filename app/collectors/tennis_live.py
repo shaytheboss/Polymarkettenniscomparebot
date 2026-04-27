@@ -9,7 +9,10 @@ ESPN scoreboard response structure (discovered from live logs):
   data["events"]               → list of TOURNAMENT containers
   tournament["groupings"]      → list of ROUNDS
   round["events"]              → list of individual MATCH events
-  match["competitions"]        → standard ESPN competition format
+
+ESPN match event formats (both handled):
+  Format A (Grand Slams/direct): event["competitions"][0]["competitors"]
+  Format B (groupings sub-events): event["competitors"] directly on event
 """
 from __future__ import annotations
 import datetime
@@ -243,27 +246,44 @@ def _safe_int(v) -> int:
 def _parse_espn_match(event: dict, tour: str, parent_venue: dict = None,
                       parent_tournament: str = "") -> Optional[dict]:
     """
-    Parse a single ESPN match event (a dict that should have 'competitions').
-    parent_venue / parent_tournament come from the enclosing tournament container.
+    Parse a single ESPN match event. Handles two ESPN formats:
+      Format A: event["competitions"][0]["competitors"]  (direct scoreboard / Grand Slams)
+      Format B: event["competitors"] directly            (groupings sub-events — most common)
     """
     eid = event.get("id", "?")
-    competitions = event.get("competitions") or []
-    if not competitions:
-        logger.warning(
-            f"ESPN {tour} match {eid}: no 'competitions' key. "
-            f"Available keys: {list(event.keys())}"
-        )
-        return None
-    comp = competitions[0]
 
-    status_obj = comp.get("status") or event.get("status") or {}
+    competitions = event.get("competitions") or []
+    if competitions:
+        # Format A — standard ESPN competition wrapper
+        comp = competitions[0]
+        status_obj = comp.get("status") or event.get("status") or {}
+        competitors = comp.get("competitors") or []
+        situation = comp.get("situation") or {}
+        serving_id = situation.get("servingAthleteId") or situation.get("serverId")
+        server = 0
+        if serving_id and competitors:
+            c1_id = str((competitors[0].get("athlete") or competitors[0]).get("id", ""))
+            server = 0 if str(serving_id) == c1_id else 1
+    else:
+        # Format B — competitors directly on event (groupings sub-events)
+        competitors = event.get("competitors") or []
+        if not competitors:
+            logger.debug(f"ESPN {tour} match {eid}: no competitors in either format, skipping")
+            return None
+        status_obj = event.get("status") or {}
+        server = 0
+        for i, c in enumerate(competitors):
+            if c.get("serving"):
+                server = i
+                break
+
     status_type = (status_obj.get("type") or {}).get("name", "STATUS_SCHEDULED")
     status = _ESPN_STATUS.get(status_type, "scheduled")
 
-    competitors = comp.get("competitors") or []
     if len(competitors) < 2:
-        logger.warning(f"ESPN {tour} match {eid}: only {len(competitors)} competitor(s)")
+        logger.debug(f"ESPN {tour} match {eid}: only {len(competitors)} competitor(s), skipping")
         return None
+
     c1, c2 = competitors[0], competitors[1]
 
     def get_name(c: dict) -> str:
@@ -294,13 +314,6 @@ def _parse_espn_match(event: dict, tour: str, parent_venue: dict = None,
             p1_games = g1
             p2_games = g2
 
-    situation = comp.get("situation") or {}
-    serving_id = situation.get("servingAthleteId") or situation.get("serverId")
-    server = 0
-    if serving_id:
-        c1_id = str((c1.get("athlete") or c1).get("id", ""))
-        server = 0 if str(serving_id) == c1_id else 1
-
     venue = event.get("venue") or parent_venue or {}
     surface_str = venue.get("surface") or ""
     surface = _surface_normalize(surface_str)
@@ -318,9 +331,8 @@ def _parse_espn_match(event: dict, tour: str, parent_venue: dict = None,
 
     p1_name = get_name(c1)
     p2_name = get_name(c2)
-    logger.info(
-        f"ESPN {tour} match parsed: {p1_name} vs {p2_name} "
-        f"| status={status} | score={', '.join(score_parts) or 'n/a'}"
+    logger.debug(
+        f"ESPN {tour}: {p1_name} vs {p2_name} status={status} score={', '.join(score_parts) or 'n/a'}"
     )
 
     return {
@@ -355,7 +367,7 @@ def _expand_espn_tournament(tournament: dict, tour: str) -> list[dict]:
     groupings = tournament.get("groupings") or []
 
     if not groupings:
-        logger.warning(f"ESPN {tour} tournament '{tname}': has 0 groupings")
+        logger.debug(f"ESPN {tour} tournament '{tname}': has 0 groupings")
         return []
 
     logger.info(

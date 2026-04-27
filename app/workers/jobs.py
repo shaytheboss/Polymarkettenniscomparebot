@@ -11,6 +11,7 @@ Name matching flow:
   Edge detection → alert
 """
 from __future__ import annotations
+import asyncio
 import logging
 from datetime import datetime, timezone
 
@@ -103,6 +104,9 @@ async def _job_fetch_live_scores_inner():
     )
 
     new_count = updated_count = 0
+    new_match_lines: list[str] = []
+    newly_live_lines: list[str] = []
+
     async with AsyncSessionLocal() as db:
         for raw in raw_matches:
             ext_id = raw["external_id"]
@@ -131,7 +135,17 @@ async def _job_fetch_live_scores_inner():
                     f"status={raw['status']}"
                 )
                 new_count += 1
+                icon = {"live": "🟢", "scheduled": "🕐", "finished": "✅"}.get(raw["status"], "❓")
+                new_match_lines.append(
+                    f"{icon} {raw['player1_name']} vs {raw['player2_name']} "
+                    f"({raw['tour']} | {raw['surface']})"
+                )
             else:
+                if match.status != "live" and raw["status"] == "live":
+                    newly_live_lines.append(
+                        f"🟢 {raw['player1_name']} vs {raw['player2_name']} "
+                        f"({raw['tour']} | {raw['surface']})"
+                    )
                 updated_count += 1
 
             match.status      = raw["status"]
@@ -147,6 +161,18 @@ async def _job_fetch_live_scores_inner():
 
         await db.commit()
     logger.info(f"DB upsert complete: {new_count} new, {updated_count} updated")
+
+    # Telegram: notify about newly discovered matches (any status)
+    if new_match_lines:
+        from app.bot.telegram_bot import broadcast_message
+        msg = f"🎾 {len(new_match_lines)} משחק/י חדש נמצאו:\n" + "\n".join(new_match_lines)
+        asyncio.ensure_future(broadcast_message(msg))
+
+    # Telegram: notify when a match transitions from scheduled → live
+    if newly_live_lines:
+        from app.bot.telegram_bot import broadcast_message
+        msg = f"🔴 {len(newly_live_lines)} משחק/י התחיל/ו:\n" + "\n".join(newly_live_lines)
+        asyncio.ensure_future(broadcast_message(msg))
 
 
 # ---------------------------------------------------------------------------

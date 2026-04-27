@@ -111,6 +111,36 @@ async def send_opportunity_alert(opportunity, match, db) -> None:
     await db.commit()
 
 
+async def broadcast_message(text: str, parse_mode: str = None) -> None:
+    """Send a plain text message to all active Telegram subscribers."""
+    if not settings.telegram_bot_token:
+        return
+
+    from sqlalchemy import select
+    from app.models.alert import TelegramUser
+    from app.database import AsyncSessionLocal
+
+    try:
+        async with AsyncSessionLocal() as db:
+            users_result = await db.execute(
+                select(TelegramUser).where(TelegramUser.active == True)
+            )
+            users = users_result.scalars().all()
+
+        bot = Bot(token=settings.telegram_bot_token)
+        for user in users:
+            try:
+                await bot.send_message(
+                    chat_id=user.chat_id,
+                    text=text,
+                    parse_mode=parse_mode,
+                )
+            except Exception as e:
+                logger.error(f"broadcast_message to {user.chat_id} failed: {e}")
+    except Exception as e:
+        logger.error(f"broadcast_message DB query failed: {e}")
+
+
 async def main():
     if not settings.telegram_bot_token:
         logger.error("TELEGRAM_BOT_TOKEN not set")
