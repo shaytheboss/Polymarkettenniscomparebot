@@ -9,8 +9,8 @@ from telegram.ext import Application, CommandHandler
 
 from app.config import settings
 from app.bot.handlers import (
-    cmd_start, cmd_status, cmd_live, cmd_opps,
-    cmd_settings, cmd_set_edge, cmd_set_tours,
+    cmd_start, cmd_help, cmd_status, cmd_live,
+    cmd_opps, cmd_settings, cmd_set_edge, cmd_set_tours,
 )
 from app.bot.formatters import fmt_opportunity
 
@@ -22,42 +22,56 @@ def get_app() -> Application:
     global _app
     if _app is None:
         _app = Application.builder().token(settings.telegram_bot_token).build()
-        _app.add_handler(CommandHandler("start", cmd_start))
-        _app.add_handler(CommandHandler("status", cmd_status))
-        _app.add_handler(CommandHandler("live", cmd_live))
-        _app.add_handler(CommandHandler("opps", cmd_opps))
-        _app.add_handler(CommandHandler("settings", cmd_settings))
-        _app.add_handler(CommandHandler("set_edge", cmd_set_edge))
-        _app.add_handler(CommandHandler("set_tours", cmd_set_tours))
+        _app.add_handler(CommandHandler("start",      cmd_start))
+        _app.add_handler(CommandHandler("help",       cmd_help))
+        _app.add_handler(CommandHandler("status",     cmd_status))
+        _app.add_handler(CommandHandler("live",       cmd_live))
+        _app.add_handler(CommandHandler("opps",       cmd_opps))
+        _app.add_handler(CommandHandler("settings",   cmd_settings))
+        _app.add_handler(CommandHandler("set_edge",   cmd_set_edge))
+        _app.add_handler(CommandHandler("set_tours",  cmd_set_tours))
     return _app
 
 
 async def send_opportunity_alert(opportunity, match, db) -> None:
-    """Broadcast opportunity to all eligible subscribers."""
+    """Broadcast opportunity alert to all eligible subscribers."""
     if not settings.telegram_bot_token:
         return
 
     from sqlalchemy import select
     from app.models.alert import TelegramUser, Alert
 
-    p1_name = match.player1.name if match.player1 else "P1"
-    p2_name = match.player2.name if match.player2 else "P2"
+    p1 = match.player1
+    p2 = match.player2
+    p1_name = p1.name if p1 else "P1"
+    p2_name = p2.name if p2 else "P2"
+    p1_elo = float(match.p1_elo_at_match or (p1.current_elo if p1 else 1500) or 1500)
+    p2_elo = float(match.p2_elo_at_match or (p2.current_elo if p2 else 1500) or 1500)
+    elo_gap = p1_elo - p2_elo
+
+    extra = opportunity.extra or {}
 
     text = fmt_opportunity(
         match_name=f"{p1_name} vs {p2_name}",
         score_text=opportunity.score_text or match.score_text or "?",
         back_player=opportunity.back_player_name,
-        table_prob=opportunity.table_prob,
-        markov_prob=opportunity.markov_prob,
-        consensus_prob=opportunity.consensus_prob,
-        poly_price=opportunity.poly_price,
-        edge_pp=opportunity.edge_pp,
-        model_agreement=opportunity.model_agreement,
-        edge_category=opportunity.edge_category,
-        elo_band=(opportunity.extra or {}).get("elo_band", "?"),
+        table_prob=float(opportunity.table_prob),
+        markov_prob=float(opportunity.markov_prob),
+        consensus_prob=float(opportunity.consensus_prob),
+        poly_price=float(opportunity.poly_price),
+        edge_pp=float(opportunity.edge_pp),
+        model_agreement=float(opportunity.model_agreement),
+        edge_category=opportunity.edge_category or "WEAK",
+        elo_band=extra.get("elo_band", "?"),
+        elo_gap=elo_gap,
         surface=match.surface,
         tournament=match.tournament or "",
-        notes=(opportunity.extra or {}).get("table_notes", ""),
+        tour=match.tour,
+        table_notes=extra.get("table_notes", ""),
+        p1_sets=opportunity.p1_sets or 0,
+        p2_sets=opportunity.p2_sets or 0,
+        p1_games=opportunity.p1_games or 0,
+        p2_games=opportunity.p2_games or 0,
     )
 
     users_result = await db.execute(
@@ -86,7 +100,7 @@ async def send_opportunity_alert(opportunity, match, db) -> None:
             )
             db.add(alert)
         except Exception as e:
-            logger.error(f"Failed to send alert to {user.chat_id}: {e}")
+            logger.error(f"Alert send failed to {user.chat_id}: {e}")
 
     opportunity.alert_sent = True
     from datetime import datetime, timezone

@@ -1,10 +1,7 @@
 """
 Core opportunity detector.
-For each live match:
-  1. Compute dual-model probability
-  2. Compare to Polymarket price
-  3. Detect edges and persist opportunities
-  4. Return new opportunities for alerting
+For each live match: compute dual-model probability, compare to Polymarket,
+detect edges, persist opportunities, and return them for alerting.
 """
 from __future__ import annotations
 import logging
@@ -15,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.engine.calculator import calculate, MatchState
+from app.engine.tables import elo_band as get_elo_band
 from app.models.match import Match, MatchSnapshot
 from app.models.opportunity import Opportunity
 from app.models.player import Player
@@ -30,6 +28,30 @@ def _edge_category(edge_pp: float) -> str:
     return "WEAK"
 
 
+def _detect_edge_type(
+    p1_sets: int, p2_sets: int, elo_band: str, surface: str, score_text: str
+) -> str:
+    """Classify which of the 3 documented edges this is, if any."""
+    # Edge 1: heavy favorite lost set 1
+    if elo_band in ("E2", "E3") and p1_sets == 0 and p2_sets == 1:
+        return "SET1_LOSS_HEAVY_FAV"
+    # Edge 3: serving for match (5-4 in set 3)
+    if p1_sets == 1 and p2_sets == 1 and "5-4" in (score_text or ""):
+        return "SERVING_FOR_MATCH"
+    # Edge 2: WTA rebreak (detected separately from market price context, flagged generically)
+    return "OTHER"
+
+
+def _kelly(prob: float, poly_price: float) -> float:
+    """Full Kelly fraction, clamped 0-0.25."""
+    if poly_price <= 0 or poly_price >= 1:
+        return 0.0
+    b = (1.0 / poly_price) - 1.0
+    q = 1.0 - prob
+    k = (prob * b - q) / b
+    return max(0.0, min(0.25, k))
+
+
 async def process_live_match(
     match: Match,
     db: AsyncSession,
@@ -40,22 +62,23 @@ async def process_live_match(
     """
     if match.status != "live":
         return []
-
     if not match.player1 or not match.player2:
         return []
 
-    # Build MatchState (player1 = higher ELO = "favorite")
     p1 = match.player1
     p2 = match.player2
-    p1_elo = p1.surface_elo(match.surface)
-    p2_elo = p2.surface_elo(match.surface)
+    p1_elo = float(match.p1_elo_at_match or p1.surface_elo(match.surface))
+    p2_elo = float(match.p2_elo_at_match or p2.surface_elo(match.surface))
 
-    # If p2 has higher ELO, swap so player1 is always the "favorite" in the model
+    # Normalise: player1 in our model = higher ELO (the "favorite")
     swapped = False
     if p2_elo > p1_elo:
         p1, p2 = p2, p1
         p1_elo, p2_elo = p2_elo, p1_elo
         swapped = True
+
+    elo_gap = p1_elo - p2_elo
+    band = get_elo_band(elo_gap)
 
     state = MatchState(
         player1_name=p1.name,
@@ -74,10 +97,9 @@ async def process_live_match(
         in_tiebreak=match.in_tiebreak,
     )
 
-    # Polymarket price (from match record, updated by polymarket job)
     poly_price = match.last_poly_price_p1
     if swapped and poly_price is not None:
-        poly_price = 1.0 - poly_price  # flip to represent favorite
+        poly_price = 1.0 - poly_price
 
     result = calculate(
         state=state,
@@ -85,7 +107,11 @@ async def process_live_match(
         min_edge_pp=settings.default_min_edge_pp,
     )
 
-    # Always save snapshot
+    # Serve probs from Markov model
+    p1_serve = result.markov_model.p1_serve_prob
+    p2_serve = result.markov_model.p2_serve_prob
+
+    # Save snapshot
     snapshot = MatchSnapshot(
         match_id=match.id,
         p1_sets=state.p1_sets,
@@ -102,10 +128,13 @@ async def process_live_match(
         model_agreement=result.model_agreement,
         poly_price_p1=poly_price,
         edge_consensus=result.edge_consensus,
+        p1_serve_prob=p1_serve,
+        p2_serve_prob=p2_serve,
+        elo_gap=elo_gap,
         raw_data={
             "table_notes": result.table_model.notes,
             "markov_notes": result.markov_model.notes,
-            "elo_band": result.table_model.elo_band,
+            "elo_band": band,
         },
     )
     db.add(snapshot)
@@ -117,56 +146,79 @@ async def process_live_match(
 
     edge_pp = abs(result.edge_consensus or 0) * 100
 
-    # Check for duplicate alert within dedup window
+    # Dedup: skip if same direction alerted recently
     dedup_since = datetime.now(timezone.utc) - timedelta(minutes=settings.alert_dedup_minutes)
+    back_player_num = 1 if result.opportunity_direction == "BACK_P1" else 2
     existing = await db.execute(
         select(Opportunity).where(
             Opportunity.match_id == match.id,
-            Opportunity.back_player == (1 if result.opportunity_direction == "BACK_P1" else 2),
+            Opportunity.back_player == back_player_num,
             Opportunity.detected_at >= dedup_since,
         )
     )
     if existing.scalar_one_or_none():
         return new_opportunities
 
-    # Map direction back to actual player
+    # Map direction back to original player ordering
     if result.opportunity_direction == "BACK_P1":
         back_player = 1 if not swapped else 2
         back_name = p1.name
+        opp_prob = result.table_model.p1_win_prob
+        opp_markov = result.markov_model.p1_win_prob
+        opp_consensus = result.consensus_prob
+        opp_poly = poly_price
     else:
         back_player = 2 if not swapped else 1
         back_name = p2.name
+        opp_prob = result.table_model.p2_win_prob
+        opp_markov = result.markov_model.p2_win_prob
+        opp_consensus = 1.0 - result.consensus_prob
+        opp_poly = 1.0 - poly_price
+
+    edge_type = _detect_edge_type(
+        state.p1_sets, state.p2_sets, band, match.surface, match.score_text or ""
+    )
+    kelly = _kelly(opp_consensus, opp_poly)
 
     opp = Opportunity(
         match_id=match.id,
         back_player=back_player,
         back_player_name=back_name,
-        table_prob=result.table_model.p1_win_prob if back_player == 1 else result.table_model.p2_win_prob,
-        markov_prob=result.markov_model.p1_win_prob if back_player == 1 else result.markov_model.p2_win_prob,
-        consensus_prob=result.consensus_prob if back_player == 1 else 1 - result.consensus_prob,
-        poly_price=poly_price if back_player == 1 else 1 - poly_price,
+        table_prob=opp_prob,
+        markov_prob=opp_markov,
+        consensus_prob=opp_consensus,
+        poly_price=opp_poly,
         edge_pp=edge_pp,
         model_agreement=result.model_agreement * 100,
+        elo_gap=elo_gap,
+        elo_band=band,
+        surface=match.surface,
+        tour=match.tour,
+        edge_category=_edge_category(edge_pp),
+        edge_type=edge_type,
+        p1_serve_prob=p1_serve,
+        p2_serve_prob=p2_serve,
+        kelly_fraction=kelly,
         score_text=match.score_text,
         p1_sets=match.p1_sets,
         p2_sets=match.p2_sets,
         p1_games=match.p1_games,
         p2_games=match.p2_games,
-        edge_category=_edge_category(edge_pp),
         extra={
-            "elo_band": result.table_model.elo_band,
+            "elo_band": band,
             "table_notes": result.table_model.notes,
             "surface": match.surface,
             "tournament": match.tournament,
+            "edge_type": edge_type,
         },
     )
     db.add(opp)
     new_opportunities.append(opp)
 
     logger.info(
-        f"OPPORTUNITY: {back_name} | edge={edge_pp:.1f}pp | "
-        f"consensus={result.consensus_prob*100:.1f}% vs poly={poly_price*100:.1f}% | "
-        f"match={match.score_text}"
+        f"OPPORTUNITY [{edge_type}]: {back_name} | edge={edge_pp:.1f}pp "
+        f"| consensus={opp_consensus*100:.1f}% vs poly={opp_poly*100:.1f}% "
+        f"| kelly={kelly:.1%} | {match.score_text}"
     )
 
     return new_opportunities

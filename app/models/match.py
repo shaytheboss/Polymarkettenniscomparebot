@@ -79,6 +79,11 @@ class MatchSnapshot(Base):
     consensus_prob_p1 = Column(Float)
     model_agreement = Column(Float)
 
+    # Markov calibration — serve probabilities used
+    p1_serve_prob = Column(Float, nullable=True)
+    p2_serve_prob = Column(Float, nullable=True)
+    elo_gap = Column(Float, nullable=True)
+
     # Market
     poly_price_p1 = Column(Float, nullable=True)
     edge_consensus = Column(Float, nullable=True)
