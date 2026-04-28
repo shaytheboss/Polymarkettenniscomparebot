@@ -249,15 +249,17 @@ def _build_live_notification(header: str, raw: dict, match) -> str:
 async def job_fetch_polymarket():
     """Update Polymarket prices for all live matches using fuzzy name search."""
     from app.bot.telegram_bot import broadcast_message
+    from sqlalchemy.orm import selectinload
     async with AsyncSessionLocal() as db:
-        result = await db.execute(select(Match).where(Match.status == "live"))
+        result = await db.execute(
+            select(Match)
+            .options(selectinload(Match.player1), selectinload(Match.player2))
+            .where(Match.status == "live")
+        )
         matches = result.scalars().all()
 
         for match in matches:
             try:
-                # Ensure player names loaded
-                if not match.player1:
-                    await db.refresh(match, ["player1", "player2"])
                 if not match.player1 or not match.player2:
                     continue
 
@@ -307,17 +309,21 @@ async def job_fetch_polymarket():
 
 async def job_run_analyzer():
     """Run probability calculation and opportunity detection on all live matches."""
+    from sqlalchemy.orm import selectinload
     async with AsyncSessionLocal() as db:
         result = await db.execute(
-            select(Match).where(Match.status == "live")
+            select(Match)
+            .options(
+                selectinload(Match.player1),
+                selectinload(Match.player2),
+                selectinload(Match.snapshots),
+            )
+            .where(Match.status == "live")
         )
         matches = result.scalars().all()
 
         for match in matches:
             try:
-                if not match.player1:
-                    await db.refresh(match, ["player1", "player2", "snapshots"])
-
                 # Skip if no Polymarket price yet (no edge to detect)
                 if match.last_poly_price_p1 is None:
                     continue
