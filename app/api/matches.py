@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select, desc
+from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional
 
@@ -16,19 +17,36 @@ async def list_matches(
     limit: int = Query(50, le=200),
     db: AsyncSession = Depends(get_db),
 ):
-    q = select(Match).order_by(desc(Match.updated_at)).limit(limit)
+    q = (
+        select(Match)
+        .options(
+            selectinload(Match.player1),
+            selectinload(Match.player2),
+            selectinload(Match.snapshots),
+        )
+        .order_by(desc(Match.updated_at))
+        .limit(limit)
+    )
     if status:
         q = q.where(Match.status == status)
     if tour:
         q = q.where(Match.tour == tour)
     result = await db.execute(q)
     matches = result.scalars().all()
-    return [_match_to_dict(m) for m in matches]
+    return [_match_to_dict(m, with_snapshots=True) for m in matches]
 
 
 @router.get("/{match_id}")
 async def get_match(match_id: int, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Match).where(Match.id == match_id))
+    result = await db.execute(
+        select(Match)
+        .options(
+            selectinload(Match.player1),
+            selectinload(Match.player2),
+            selectinload(Match.snapshots),
+        )
+        .where(Match.id == match_id)
+    )
     match = result.scalar_one_or_none()
     if not match:
         from fastapi import HTTPException

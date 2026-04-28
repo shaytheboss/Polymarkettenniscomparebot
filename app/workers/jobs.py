@@ -126,8 +126,8 @@ async def _job_fetch_live_scores_inner():
     )
 
     new_count = updated_count = 0
-    new_match_lines: list[str] = []
-    newly_live_lines: list[str] = []
+    live_notifications: list[str] = []   # new + transitioned-to-live matches
+    set_won_notifications: list[str] = []  # set completed during live match
 
     async with AsyncSessionLocal() as db:
         for raw in raw_matches:
@@ -164,16 +164,24 @@ async def _job_fetch_live_scores_inner():
                     f"status={raw['status']}"
                 )
                 new_count += 1
-                # Only notify about new LIVE matches (not the entire historical bracket)
                 if raw["status"] == "live":
-                    new_match_lines.append(
-                        f"🟢 {p1_name} vs {p2_name} ({raw['tour']} | {raw['surface']})"
+                    live_notifications.append(
+                        _build_live_notification("🟢 משחק חדש התחיל!", raw, match)
                     )
             else:
+                # Detect transition to live
                 if match.status != "live" and raw["status"] == "live":
-                    newly_live_lines.append(
-                        f"🟢 {p1_name} vs {p2_name} ({raw['tour']} | {raw['surface']})"
+                    live_notifications.append(
+                        _build_live_notification("🔴 משחק התחיל!", raw, match)
                     )
+                # Detect set completion during live match
+                elif match.status == "live" and raw["status"] == "live":
+                    old_sets = (match.p1_sets or 0) + (match.p2_sets or 0)
+                    new_sets = raw["p1_sets"] + raw["p2_sets"]
+                    if new_sets > old_sets:
+                        set_won_notifications.append(
+                            _build_live_notification("🎾 סט הסתיים!", raw, match)
+                        )
                 updated_count += 1
 
             match.status      = raw["status"]
@@ -190,17 +198,48 @@ async def _job_fetch_live_scores_inner():
         await db.commit()
     logger.info(f"DB upsert complete: {new_count} new, {updated_count} updated")
 
-    # Telegram: notify about newly discovered matches (any status)
-    if new_match_lines:
-        from app.bot.telegram_bot import broadcast_message
-        msg = f"🎾 {len(new_match_lines)} משחק/י חדש נמצאו:\n" + "\n".join(new_match_lines)
+    from app.bot.telegram_bot import broadcast_message
+    for msg in live_notifications + set_won_notifications:
         asyncio.ensure_future(broadcast_message(msg))
 
-    # Telegram: notify when a match transitions from scheduled → live
-    if newly_live_lines:
-        from app.bot.telegram_bot import broadcast_message
-        msg = f"🔴 {len(newly_live_lines)} משחק/י התחיל/ו:\n" + "\n".join(newly_live_lines)
-        asyncio.ensure_future(broadcast_message(msg))
+
+# ---------------------------------------------------------------------------
+# Notification helpers
+# ---------------------------------------------------------------------------
+
+def _poly_url(p1_name: str, p2_name: str) -> str:
+    last1 = p1_name.split()[-1]
+    last2 = p2_name.split()[-1]
+    return f"https://polymarket.com/markets?search={last1}+{last2}&tag=tennis"
+
+
+def _build_live_notification(header: str, raw: dict, match) -> str:
+    """Build a Telegram message for a match going live or a set completing."""
+    p1 = raw["player1_name"]
+    p2 = raw["player2_name"]
+    score = raw.get("score_text") or "—"
+    surface_emoji = {"hard": "🔵", "clay": "🟤", "grass": "🟢"}.get(raw["surface"], "⚫")
+    p1_elo = match.p1_elo_at_match or 1500
+    p2_elo = match.p2_elo_at_match or 1500
+
+    poly_line = ""
+    if match.last_poly_price_p1 is not None:
+        pr = match.last_poly_price_p1
+        poly_line = (
+            f"\n💰 Polymarket: {p1.split()[-1]} {pr*100:.0f}% | "
+            f"{p2.split()[-1]} {(1-pr)*100:.0f}%"
+        )
+
+    return (
+        f"{header}\n"
+        f"🎾 {p1} vs {p2}\n"
+        f"{surface_emoji} {raw['tour']} | {raw['surface'].capitalize()}"
+        f" | {raw.get('tournament','')}\n"
+        f"📊 Score: {score}\n"
+        f"ELO: {p1.split()[-1]} {p1_elo:.0f} vs {p2.split()[-1]} {p2_elo:.0f}"
+        f"{poly_line}\n"
+        f"🔗 {_poly_url(p1, p2)}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +248,7 @@ async def _job_fetch_live_scores_inner():
 
 async def job_fetch_polymarket():
     """Update Polymarket prices for all live matches using fuzzy name search."""
+    from app.bot.telegram_bot import broadcast_message
     async with AsyncSessionLocal() as db:
         result = await db.execute(select(Match).where(Match.status == "live"))
         matches = result.scalars().all()
@@ -234,9 +274,26 @@ async def job_fetch_polymarket():
                     match.last_poly_price_p1 = price
                     match.poly_updated_at = datetime.now(timezone.utc)
 
-                if cid and not match.polymarket_condition_id:
+                newly_linked = cid and not match.polymarket_condition_id
+                if newly_linked:
                     match.polymarket_condition_id = cid
                     logger.info(f"Linked Polymarket market {cid} to {p1_name} vs {p2_name}")
+
+                # Notify when Polymarket is first linked to a live match
+                if newly_linked and price is not None:
+                    poly_url = _poly_url(p1_name, p2_name)
+                    p1_elo = match.p1_elo_at_match or 1500
+                    p2_elo = match.p2_elo_at_match or 1500
+                    msg = (
+                        f"💹 Polymarket נמצא!\n"
+                        f"🎾 {p1_name} vs {p2_name}\n"
+                        f"💰 {p1_name.split()[-1]}: {price*100:.0f}% | "
+                        f"{p2_name.split()[-1]}: {(1-price)*100:.0f}%\n"
+                        f"ELO: {p1_elo:.0f} vs {p2_elo:.0f}\n"
+                        f"Score: {match.score_text or '—'}\n"
+                        f"🔗 {poly_url}"
+                    )
+                    asyncio.ensure_future(broadcast_message(msg))
 
             except Exception as e:
                 logger.debug(f"Polymarket update failed for match {match.id}: {e}")
