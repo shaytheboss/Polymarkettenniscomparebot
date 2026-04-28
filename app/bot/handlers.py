@@ -341,3 +341,156 @@ async def cmd_track(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             f"ניקוד: {score}\n"
             f"סטטוס: {m['status']}"
         )
+
+
+async def cmd_polytest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Test Polymarket API connectivity and show diagnostic information."""
+    await update.message.reply_text("🔍 בודק חיבור ל-Polymarket...")
+
+    from app.collectors.polymarket import test_connectivity
+    diag = await test_connectivity()
+
+    proxy_line = (
+        f"🔀 פרוקסי: {diag['proxy_hint']}"
+        if diag["proxy_configured"]
+        else "⚠️ פרוקסי: לא מוגדר (Railway IPs חסומים ע\"י Polymarket)"
+    )
+
+    if diag["ok"]:
+        status_line = f"✅ API זמין — {diag['markets_found']} שווקים נמצאו"
+        sample_line = f"דוגמה: {diag['sample_question']}" if diag["sample_question"] else ""
+    else:
+        status_line = f"❌ API חסום — {diag['http_status']}"
+        sample_line = (
+            "כדי לפתור:\n"
+            "1. הגדר POLYMARKET_PROXY_URL ב-Railway env vars\n"
+            "   (proxy עם IP ביתי, למשל webshare.io)\n"
+            "2. או השתמש ב-/setpoly להוספה ידנית"
+        )
+
+    lines = [proxy_line, status_line]
+    if sample_line:
+        lines.append(sample_line)
+
+    if diag["last_cache_error"]:
+        lines.append(f"שגיאה אחרונה: {diag['last_cache_error'][:80]}")
+
+    # Also show current live matches with Polymarket linkage status
+    async with AsyncSessionLocal() as db:
+        from sqlalchemy.orm import selectinload
+        result = await db.execute(
+            select(Match)
+            .options(selectinload(Match.player1), selectinload(Match.player2))
+            .where(Match.status == "live")
+            .limit(5)
+        )
+        live = result.scalars().all()
+
+    if live:
+        lines.append("\nמשחקים חיים:")
+        for m in live:
+            p1 = m.player1.name if m.player1 else "?"
+            p2 = m.player2.name if m.player2 else "?"
+            poly_status = (
+                f"✅ {m.last_poly_price_p1*100:.0f}%"
+                if m.last_poly_price_p1 is not None
+                else ("🔗 מקושר" if m.polymarket_condition_id else "❌ לא נמצא")
+            )
+            lines.append(f"  {p1} vs {p2} → {poly_status}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_setpoly(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Manually link a Polymarket market to a live match.
+    Usage: /setpoly <player_name> <condition_id_or_slug>
+
+    The condition ID or slug comes from the Polymarket market URL:
+      https://polymarket.com/event/{slug}?tid={condition_id}
+
+    Examples:
+      /setpoly Alcaraz 0xabc123...
+      /setpoly Djokovic will-djokovic-beat-alcaraz
+    """
+    args = ctx.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "שימוש: /setpoly <שחקן> <condition_id>\n\n"
+            "מצא את ה-condition_id בכתובת URL של השוק ב-Polymarket:\n"
+            "https://polymarket.com/event/{slug}?tid={condition_id}\n\n"
+            "דוגמה:\n"
+            "/setpoly Alcaraz 0x1234abcd..."
+        )
+        return
+
+    player_query = args[0].lower()
+    condition_id = args[1]
+
+    async with AsyncSessionLocal() as db:
+        from sqlalchemy.orm import selectinload
+        result = await db.execute(
+            select(Match)
+            .options(selectinload(Match.player1), selectinload(Match.player2))
+            .where(Match.status == "live")
+        )
+        live = result.scalars().all()
+
+    # Find matching live match
+    match = None
+    for m in live:
+        p1 = m.player1.name if m.player1 else ""
+        p2 = m.player2.name if m.player2 else ""
+        if player_query in p1.lower() or player_query in p2.lower():
+            match = m
+            break
+
+    if not match:
+        names = [
+            f"{m.player1.name if m.player1 else '?'} vs {m.player2.name if m.player2 else '?'}"
+            for m in live
+        ]
+        await update.message.reply_text(
+            f"לא נמצא משחק חי עם '{args[0]}'.\n"
+            f"משחקים חיים:\n" + "\n".join(f"  • {n}" for n in names) if names else "אין משחקים חיים."
+        )
+        return
+
+    # Update the match
+    async with AsyncSessionLocal() as db:
+        from sqlalchemy.orm import selectinload
+        result = await db.execute(
+            select(Match)
+            .options(selectinload(Match.player1), selectinload(Match.player2))
+            .where(Match.id == match.id)
+        )
+        m = result.scalar_one()
+        m.polymarket_condition_id = condition_id
+        # If it looks like a slug (not hex), also store as slug
+        if not condition_id.startswith("0x"):
+            m.polymarket_slug = condition_id
+
+        # Try to immediately fetch the price
+        from app.collectors.polymarket import fetch_market_price
+        price = await fetch_market_price(condition_id)
+        if price is not None:
+            from datetime import datetime, timezone
+            m.last_poly_price_p1 = price
+            m.poly_updated_at = datetime.now(timezone.utc)
+
+        await db.commit()
+
+    p1 = match.player1.name if match.player1 else "?"
+    p2 = match.player2.name if match.player2 else "?"
+
+    if price is not None:
+        await update.message.reply_text(
+            f"✅ {p1} vs {p2}\n"
+            f"Polymarket מקושר: {condition_id[:20]}...\n"
+            f"מחיר: {p1.split()[-1]} {price*100:.0f}% | {p2.split()[-1]} {(1-price)*100:.0f}%"
+        )
+    else:
+        await update.message.reply_text(
+            f"🔗 {p1} vs {p2} — condition ID נשמר: {condition_id[:20]}...\n"
+            f"⚠️ לא הצלחתי לקרוא מחיר. ודא שה-ID נכון ושה-API זמין."
+        )

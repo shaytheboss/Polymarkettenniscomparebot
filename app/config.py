@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     api_tennis_key: str = ""           # api-tennis.com (RapidAPI)
     sportradar_api_key: str = ""       # backup live scores
     polymarket_api_key: str = ""
+    polymarket_proxy_url: str = ""     # HTTP/SOCKS proxy for Polymarket (blocked from Railway IPs)
+                                       # e.g. http://user:pass@proxy:8080 or socks5://user:pass@proxy:1080
 
     # App
     app_env: str = "development"

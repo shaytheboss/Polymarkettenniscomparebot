@@ -244,6 +244,8 @@ def fmt_help() -> str:
         "/set\\_tours ATP — סינון ATP/WTA/ALL\n"
         "/refresh — סריקה מיידית של ESPN\n"
         "/track שם — חפש שחקן ב\\-ESPN\n"
+        "/polytest — בדוק חיבור ל\\-Polymarket\n"
+        "/setpoly שחקן condition\\_id — קשר שוק Polymarket ידנית\n"
         "/help — הודעה זו\n\n"
         "*מה הבוט עושה:*\n"
         "• עוקב אחרי משחקי ATP/WTA חיים דרך ESPN\n"
