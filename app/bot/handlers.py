@@ -350,25 +350,30 @@ async def cmd_polytest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     from app.collectors.polymarket import test_connectivity
     diag = await test_connectivity()
 
-    proxy_line = (
-        f"🔀 פרוקסי: {diag['proxy_hint']}"
-        if diag["proxy_configured"]
-        else "⚠️ פרוקסי: לא מוגדר (Railway IPs חסומים ע\"י Polymarket)"
-    )
+    if diag.get("relay_configured"):
+        route_line = f"🔀 Relay: {diag['relay_hint']}"
+    elif diag.get("proxy_configured"):
+        route_line = f"🔀 Proxy: {diag['proxy_hint']}"
+    else:
+        route_line = "⚠️ אין Relay — Railway IPs חסומים ע\"י Polymarket"
+
+    endpoint_line = f"🌐 Endpoint: {diag.get('endpoint', '?')}"
 
     if diag["ok"]:
-        status_line = f"✅ API זמין — {diag['markets_found']} שווקים נמצאו"
-        sample_line = f"דוגמה: {diag['sample_question']}" if diag["sample_question"] else ""
+        status_line = f"✅ API זמין — {diag['markets_found']} שווקי טניס"
+        sample_line = f"דוגמה: \"{diag['sample_question']}\"" if diag["sample_question"] else ""
     else:
         status_line = f"❌ API חסום — {diag['http_status']}"
         sample_line = (
-            "כדי לפתור:\n"
-            "1. הגדר POLYMARKET_PROXY_URL ב-Railway env vars\n"
-            "   (proxy עם IP ביתי, למשל webshare.io)\n"
-            "2. או השתמש ב-/setpoly להוספה ידנית"
+            "\nפתרון חינמי (Cloudflare Worker):\n"
+            "1. cloudflare.com → Workers → Create Worker\n"
+            "2. הדבק את קוד cloudflare-worker.js מה-repo\n"
+            "3. Save & Deploy → קבל URL\n"
+            "4. Railway Variables: POLYMARKET_RELAY_URL=<url>\n"
+            "\nחלופה: /setpoly <שחקן> <condition_id>"
         )
 
-    lines = [proxy_line, status_line]
+    lines = [route_line, endpoint_line, status_line]
     if sample_line:
         lines.append(sample_line)
 

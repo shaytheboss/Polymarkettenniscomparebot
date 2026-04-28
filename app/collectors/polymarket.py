@@ -33,6 +33,13 @@ logger = logging.getLogger(__name__)
 
 POLY_GAMMA_BASE = "https://gamma-api.polymarket.com"
 
+
+def _gamma_base() -> str:
+    """Return base URL — relay when POLYMARKET_RELAY_URL is set, direct otherwise."""
+    from app.config import settings
+    relay = settings.polymarket_relay_url.rstrip("/")
+    return relay if relay else POLY_GAMMA_BASE
+
 _BROWSER_HEADERS = {
     "Accept": "application/json",
     "Accept-Language": "en-US,en;q=0.9",
@@ -80,7 +87,7 @@ async def _fetch_markets_batch(tag_slug: Optional[str], limit: int = 200) -> lis
 
     try:
         async with _client() as c:
-            resp = await c.get(f"{POLY_GAMMA_BASE}/markets", params=params)
+            resp = await c.get(f"{_gamma_base()}/markets", params=params)
             resp.raise_for_status()
             data = resp.json()
         return data if isinstance(data, list) else []
@@ -135,7 +142,7 @@ async def fetch_market_price(condition_id: str) -> Optional[float]:
     try:
         async with _client() as c:
             resp = await c.get(
-                f"{POLY_GAMMA_BASE}/markets",
+                f"{_gamma_base()}/markets",
                 params={"condition_id": condition_id},
             )
             resp.raise_for_status()
@@ -300,21 +307,25 @@ async def test_connectivity() -> dict:
     """
     from app.config import settings
     proxy = settings.polymarket_proxy_url
+    relay = settings.polymarket_relay_url
 
     result: dict = {
         "proxy_configured": bool(proxy),
+        "relay_configured": bool(relay),
+        "relay_hint": (relay[:40] + "...") if relay else "not set",
         "proxy_hint": (proxy[:30] + "...") if proxy else "not set",
         "ok": False,
         "http_status": None,
         "markets_found": 0,
         "sample_question": None,
         "last_cache_error": _cache.get("last_error", ""),
+        "endpoint": _gamma_base(),
     }
 
     try:
         async with _client(timeout=15.0) as c:
             resp = await c.get(
-                f"{POLY_GAMMA_BASE}/markets",
+                f"{_gamma_base()}/markets",
                 params={"active": "true", "closed": "false", "_limit": 5, "tag_slug": "tennis"},
             )
             result["http_status"] = resp.status_code

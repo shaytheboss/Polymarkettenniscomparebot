@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     polymarket_api_key: str = ""
     polymarket_proxy_url: str = ""     # HTTP/SOCKS proxy for Polymarket (blocked from Railway IPs)
                                        # e.g. http://user:pass@proxy:8080 or socks5://user:pass@proxy:1080
+    polymarket_relay_url: str = ""     # Cloudflare Worker relay URL — preferred free solution
+                                       # Deploy cloudflare-worker.js, set this to https://xxx.workers.dev
 
     # App
     app_env: str = "development"
