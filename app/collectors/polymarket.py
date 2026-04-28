@@ -1,23 +1,21 @@
 """
 Polymarket live price collector for tennis match markets.
 
-IMPORTANT — Cloud IP blocking:
-  Polymarket's API (gamma-api.polymarket.com) blocks requests from cloud
-  hosting IPs (Railway, GCP, AWS) via Cloudflare WAF.
+Architecture (learned from weather-arb-bot):
+  1. Market DISCOVERY  — Gamma API: search by player name, get conditionId + clobTokenIds + slug
+  2. Price UPDATES     — CLOB API:  batch-fetch prices for all known token IDs in one call
+                         Fallback:  Gamma API outcomePrices if CLOB is unavailable
 
-  To fix, set POLYMARKET_PROXY_URL in Railway env vars to an HTTP/SOCKS
-  proxy with a residential IP:
-    POLYMARKET_PROXY_URL=http://user:pass@proxy.example.com:8080
-    POLYMARKET_PROXY_URL=socks5://user:pass@proxy.example.com:1080
+CLOB API is faster and more efficient: one request fetches prices for all live matches.
 
-  Free option: webshare.io (10 free residential proxies)
-  Paid option: brightdata.com, oxylabs.io, smartproxy.com
+IP blocking:
+  Polymarket blocks cloud hosting IPs (Railway, GCP, AWS) via Cloudflare WAF.
+  Fix: deploy cloudflare-worker.js and set POLYMARKET_RELAY_URL in Railway.
+  The worker routes:
+    /gamma/* → gamma-api.polymarket.com
+    /clob/*  → clob.polymarket.com
 
-Strategy:
-  1. Every 5 minutes, fetch ALL active tennis markets in one batch call
-  2. Cache them in memory — no per-match search queries needed
-  3. Match against cache by scoring both player names in market question text
-  4. Return price for the best-matching market
+Market URL: https://polymarket.com/event/{slug}
 """
 from __future__ import annotations
 import json
@@ -31,14 +29,8 @@ from app.utils.name_matcher import _last_name, _normalize
 
 logger = logging.getLogger(__name__)
 
-POLY_GAMMA_BASE = "https://gamma-api.polymarket.com"
-
-
-def _gamma_base() -> str:
-    """Return base URL — relay when POLYMARKET_RELAY_URL is set, direct otherwise."""
-    from app.config import settings
-    relay = settings.polymarket_relay_url.rstrip("/")
-    return relay if relay else POLY_GAMMA_BASE
+GAMMA_BASE = "https://gamma-api.polymarket.com"
+CLOB_BASE  = "https://clob.polymarket.com"
 
 _BROWSER_HEADERS = {
     "Accept": "application/json",
@@ -52,17 +44,39 @@ _BROWSER_HEADERS = {
     "Origin": "https://polymarket.com",
 }
 
-# In-memory market cache shared across all calls
+# In-memory market cache for discovery (refreshed every 5 min)
 _cache: dict = {"markets": [], "fetched_at": 0.0, "last_error": ""}
-_CACHE_TTL = 300  # 5 minutes
+_CACHE_TTL = 300
 
 
 # ---------------------------------------------------------------------------
-# HTTP client factory
+# URL routing — direct or through Cloudflare Worker relay
+# ---------------------------------------------------------------------------
+
+def _gamma_url(path: str) -> str:
+    """Build Gamma API URL, routing through relay if configured."""
+    from app.config import settings
+    relay = settings.polymarket_relay_url.rstrip("/")
+    if relay:
+        return f"{relay}/gamma{path}"
+    return f"{GAMMA_BASE}{path}"
+
+
+def _clob_url(path: str) -> str:
+    """Build CLOB API URL, routing through relay if configured."""
+    from app.config import settings
+    relay = settings.polymarket_relay_url.rstrip("/")
+    if relay:
+        return f"{relay}/clob{path}"
+    return f"{CLOB_BASE}{path}"
+
+
+# ---------------------------------------------------------------------------
+# HTTP client
 # ---------------------------------------------------------------------------
 
 def _client(timeout: float = 12.0) -> httpx.AsyncClient:
-    """Create httpx client, routing through proxy if POLYMARKET_PROXY_URL is set."""
+    """Create httpx client, with optional standard proxy (not needed when using relay)."""
     from app.config import settings
     kwargs: dict = {
         "timeout": timeout,
@@ -76,7 +90,39 @@ def _client(timeout: float = 12.0) -> httpx.AsyncClient:
 
 
 # ---------------------------------------------------------------------------
-# Market cache — one batch fetch, all matches search locally
+# CLOB price fetching (batch — one call for all token IDs)
+# ---------------------------------------------------------------------------
+
+async def fetch_clob_prices(token_ids: list[str]) -> dict[str, float]:
+    """
+    Fetch current prices for multiple token IDs in one CLOB API call.
+    Returns dict: {token_id: price_float}.
+    Mirrors weather-arb-bot PolymarketCollector.get_prices().
+    """
+    if not token_ids:
+        return {}
+    try:
+        async with _client() as c:
+            resp = await c.get(
+                _clob_url("/prices"),
+                params={"token_id": ",".join(token_ids)},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        # Response: {"token_id_1": "0.65", "token_id_2": "0.35"}
+        return {k: float(v) for k, v in data.items() if v is not None}
+    except httpx.HTTPStatusError as e:
+        _cache["last_error"] = f"CLOB HTTP {e.response.status_code}: {e.response.text[:60]}"
+        logger.warning(f"CLOB /prices HTTP {e.response.status_code}")
+        return {}
+    except Exception as e:
+        _cache["last_error"] = f"CLOB {type(e).__name__}: {e}"
+        logger.warning(f"CLOB /prices error: {type(e).__name__}: {e}")
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Gamma API market discovery
 # ---------------------------------------------------------------------------
 
 async def _fetch_markets_batch(tag_slug: Optional[str], limit: int = 200) -> list[dict]:
@@ -87,39 +133,31 @@ async def _fetch_markets_batch(tag_slug: Optional[str], limit: int = 200) -> lis
 
     try:
         async with _client() as c:
-            resp = await c.get(f"{_gamma_base()}/markets", params=params)
+            resp = await c.get(_gamma_url("/markets"), params=params)
             resp.raise_for_status()
             data = resp.json()
         return data if isinstance(data, list) else []
     except httpx.HTTPStatusError as e:
-        _cache["last_error"] = f"HTTP {e.response.status_code}: {e.response.text[:80]}"
-        logger.warning(f"Polymarket API HTTP {e.response.status_code} (tag={tag_slug})")
+        _cache["last_error"] = f"Gamma HTTP {e.response.status_code}: {e.response.text[:60]}"
+        logger.warning(f"Polymarket Gamma API HTTP {e.response.status_code} (tag={tag_slug})")
         return []
     except Exception as e:
-        _cache["last_error"] = f"{type(e).__name__}: {e}"
-        logger.warning(f"Polymarket API error (tag={tag_slug}): {type(e).__name__}: {e}")
+        _cache["last_error"] = f"Gamma {type(e).__name__}: {e}"
+        logger.warning(f"Polymarket Gamma API error (tag={tag_slug}): {e}")
         return []
 
 
 async def _refresh_cache() -> list[dict]:
-    """
-    Refresh market cache by fetching all active tennis markets.
-    Tries multiple strategies: tennis tag, then no tag.
-    """
+    """Refresh market cache — try with tennis tag, then without."""
     global _cache
 
-    markets: list[dict] = []
-
-    # Strategy 1: fetch all tennis-tagged active markets
     markets = await _fetch_markets_batch(tag_slug="tennis", limit=200)
     if markets:
-        logger.info(f"Polymarket cache refreshed: {len(markets)} markets (tag=tennis)")
-
-    # Strategy 2: no tag filter — broader search
+        logger.info(f"Polymarket cache: {len(markets)} markets (tag=tennis)")
     if not markets:
         markets = await _fetch_markets_batch(tag_slug=None, limit=100)
         if markets:
-            logger.info(f"Polymarket cache refreshed: {len(markets)} markets (no tag)")
+            logger.info(f"Polymarket cache: {len(markets)} markets (no tag)")
 
     _cache["markets"] = markets
     _cache["fetched_at"] = time.time()
@@ -127,31 +165,9 @@ async def _refresh_cache() -> list[dict]:
 
 
 async def _get_cached_markets() -> list[dict]:
-    """Return cached markets, auto-refreshing when stale."""
     if time.time() - _cache["fetched_at"] > _CACHE_TTL or not _cache["markets"]:
         return await _refresh_cache()
     return _cache["markets"]
-
-
-# ---------------------------------------------------------------------------
-# Direct condition-ID price lookup (when market already linked)
-# ---------------------------------------------------------------------------
-
-async def fetch_market_price(condition_id: str) -> Optional[float]:
-    """Fetch P(player1 wins) for a known Polymarket condition ID."""
-    try:
-        async with _client() as c:
-            resp = await c.get(
-                f"{_gamma_base()}/markets",
-                params={"condition_id": condition_id},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        market = data[0] if isinstance(data, list) and data else (data or {})
-        return _extract_price(market, player_idx=0)
-    except Exception as e:
-        logger.debug(f"fetch_market_price({condition_id[:10]}...): {e}")
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -173,14 +189,10 @@ def _name_score(question_norm: str, p1: str, p2: str) -> float:
     return score
 
 
-# ---------------------------------------------------------------------------
-# Auto-discovery from cache
-# ---------------------------------------------------------------------------
-
 async def search_tennis_markets(player1: str, player2: str) -> list[dict]:
     """
-    Find the Polymarket market for this matchup by searching the market cache.
-    Returns list of candidates sorted by name-match score (best first).
+    Find the Polymarket market for this matchup by searching the cached markets.
+    Returns candidates sorted by name-match score.
     """
     all_markets = await _get_cached_markets()
     if not all_markets:
@@ -190,7 +202,7 @@ async def search_tennis_markets(player1: str, player2: str) -> list[dict]:
     for market in all_markets:
         question = _normalize(market.get("question", "") or market.get("title", ""))
         score = _name_score(question, player1, player2)
-        if score >= 1.0:  # must match at least one full last name
+        if score >= 1.0:
             scored.append((score, market))
 
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -204,78 +216,55 @@ async def search_tennis_markets(player1: str, player2: str) -> list[dict]:
     else:
         logger.debug(
             f"Polymarket: no match for {player1} vs {player2} "
-            f"(searched {len(all_markets)} cached markets)"
+            f"in {len(all_markets)} cached markets"
         )
 
     return [m for _, m in scored]
 
 
 # ---------------------------------------------------------------------------
-# Price extraction
+# Price extraction helpers
 # ---------------------------------------------------------------------------
 
-def _extract_price(market: dict, player_idx: int = 0) -> Optional[float]:
-    """Extract the win probability from a market's outcomePrices array."""
+def _extract_gamma_price(market: dict, player_idx: int = 0) -> Optional[float]:
+    """Extract win probability from a market's outcomePrices array."""
     prices_raw = market.get("outcomePrices") or market.get("prices")
     if prices_raw is None:
         return None
-
     if isinstance(prices_raw, str):
         try:
             prices_raw = json.loads(prices_raw)
         except Exception:
             return None
-
     if isinstance(prices_raw, list) and len(prices_raw) > player_idx:
         try:
             return float(prices_raw[player_idx])
         except (TypeError, ValueError):
             return None
-
     if isinstance(prices_raw, dict):
         keys = list(prices_raw.keys())
-        if keys:
+        if len(keys) > player_idx:
             try:
                 return float(prices_raw[keys[player_idx]])
             except Exception:
                 pass
-
     return None
 
 
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
+def _extract_token_ids(market: dict) -> list[str]:
+    """Extract CLOB token IDs from market dict (clobTokenIds field)."""
+    raw = market.get("clobTokenIds") or market.get("clob_token_ids") or "[]"
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return []
+    return [str(t) for t in raw] if isinstance(raw, list) else []
 
-async def fetch_match_price(
-    player1: str,
-    player2: str,
-    condition_id: Optional[str] = None,
-) -> tuple[Optional[float], Optional[str], Optional[str]]:
-    """
-    Get P(player1 wins) from Polymarket.
 
-    Returns (price, condition_id, slug):
-      price       — float in [0,1], P(player1 wins), or None if not found
-      condition_id — Polymarket market condition ID, or None
-      slug         — market slug for https://polymarket.com/event/{slug}, or None
-
-    If condition_id is already known, fetches directly.
-    Otherwise searches all cached markets by player name.
-    """
-    if condition_id:
-        price = await fetch_market_price(condition_id)
-        return price, condition_id, None
-
-    markets = await search_tennis_markets(player1, player2)
-    if not markets:
-        return None, None, None
-
-    best = markets[0]
-    cid = best.get("conditionId") or best.get("condition_id")
-    slug = best.get("slug") or best.get("groupSlug")
-
-    outcomes_raw = best.get("outcomes") or "[]"
+def _find_player1_idx(market: dict, player1: str) -> int:
+    """Determine which outcome index corresponds to player1."""
+    outcomes_raw = market.get("outcomes") or "[]"
     if isinstance(outcomes_raw, str):
         try:
             outcomes = json.loads(outcomes_raw)
@@ -284,16 +273,118 @@ async def fetch_match_price(
     else:
         outcomes = list(outcomes_raw)
 
-    # Find which outcome index corresponds to player1
     last1 = _last_name(player1)
-    player1_idx = 0
     for i, outcome_name in enumerate(outcomes):
         if last1 in _normalize(str(outcome_name)):
-            player1_idx = i
-            break
+            return i
+    return 0  # default: first outcome = player1
 
-    price = _extract_price(best, player_idx=player1_idx)
-    return price, cid, slug
+
+# ---------------------------------------------------------------------------
+# Direct condition-ID price lookup (Gamma API)
+# ---------------------------------------------------------------------------
+
+async def fetch_price_by_condition_id(condition_id: str) -> Optional[float]:
+    """Fetch P(player1 wins) from Gamma API for a known condition ID."""
+    try:
+        async with _client() as c:
+            resp = await c.get(
+                _gamma_url("/markets"),
+                params={"condition_id": condition_id},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        market = data[0] if isinstance(data, list) and data else (data or {})
+        return _extract_gamma_price(market, player_idx=0)
+    except Exception as e:
+        logger.debug(f"Gamma condition lookup {condition_id[:12]}...: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Main entry point — fetch price for a match
+# ---------------------------------------------------------------------------
+
+async def fetch_match_price(
+    player1: str,
+    player2: str,
+    condition_id: Optional[str] = None,
+    token_id: Optional[str] = None,
+) -> tuple[Optional[float], Optional[str], Optional[str], Optional[str]]:
+    """
+    Get P(player1 wins) from Polymarket.
+
+    Returns (price, condition_id, slug, token_id):
+      price        — float [0,1] P(player1 wins), or None
+      condition_id — Polymarket condition ID
+      slug         — market slug → https://polymarket.com/event/{slug}
+      token_id     — CLOB token ID for player1's outcome (for fast future lookups)
+
+    Strategy:
+      1. If token_id known: try CLOB /prices (fastest, batch-able)
+      2. If condition_id known: try Gamma API by condition_id
+      3. Auto-discover via cached market search
+    """
+    # Strategy 1: CLOB prices via token ID (fastest, learned from weather-arb-bot)
+    if token_id:
+        prices = await fetch_clob_prices([token_id])
+        if token_id in prices:
+            return prices[token_id], condition_id, None, token_id
+
+    # Strategy 2: Gamma API direct condition lookup
+    if condition_id:
+        price = await fetch_price_by_condition_id(condition_id)
+        return price, condition_id, None, token_id
+
+    # Strategy 3: Auto-discover via cached market search
+    markets = await search_tennis_markets(player1, player2)
+    if not markets:
+        return None, None, None, None
+
+    best = markets[0]
+    cid = best.get("conditionId") or best.get("condition_id")
+    slug = best.get("slug") or best.get("groupSlug")
+
+    player1_idx = _find_player1_idx(best, player1)
+    token_ids = _extract_token_ids(best)
+    p1_token = token_ids[player1_idx] if len(token_ids) > player1_idx else None
+
+    # Try CLOB first (real-time price)
+    if p1_token:
+        prices = await fetch_clob_prices([p1_token])
+        if p1_token in prices:
+            return prices[p1_token], cid, slug, p1_token
+
+    # Fall back to Gamma outcomePrices
+    price = _extract_gamma_price(best, player_idx=player1_idx)
+    return price, cid, slug, p1_token
+
+
+# ---------------------------------------------------------------------------
+# Batch price update — fetch ALL live match prices in one CLOB call
+# ---------------------------------------------------------------------------
+
+async def batch_fetch_prices(token_map: dict[str, str]) -> dict[str, float]:
+    """
+    Fetch prices for multiple matches in a single CLOB API call.
+
+    Args:
+      token_map: {match_external_id: clob_token_id}
+
+    Returns:
+      {match_external_id: price_float}
+    """
+    if not token_map:
+        return {}
+
+    token_to_ext: dict[str, str] = {v: k for k, v in token_map.items()}
+    prices = await fetch_clob_prices(list(token_map.values()))
+
+    return {
+        token_to_ext[token]: price
+        for token, price in prices.items()
+        if token in token_to_ext
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -301,10 +392,7 @@ async def fetch_match_price(
 # ---------------------------------------------------------------------------
 
 async def test_connectivity() -> dict:
-    """
-    Test Polymarket API connectivity.
-    Returns diagnostic dict — call from /polytest Telegram command.
-    """
+    """Test Polymarket API connectivity. Called from /polytest command."""
     from app.config import settings
     proxy = settings.polymarket_proxy_url
     relay = settings.polymarket_relay_url
@@ -312,20 +400,20 @@ async def test_connectivity() -> dict:
     result: dict = {
         "proxy_configured": bool(proxy),
         "relay_configured": bool(relay),
-        "relay_hint": (relay[:40] + "...") if relay else "not set",
+        "relay_hint": (relay[:50] + "...") if len(relay) > 50 else relay or "not set",
         "proxy_hint": (proxy[:30] + "...") if proxy else "not set",
         "ok": False,
         "http_status": None,
         "markets_found": 0,
         "sample_question": None,
         "last_cache_error": _cache.get("last_error", ""),
-        "endpoint": _gamma_base(),
+        "endpoint": _gamma_url("/markets"),
     }
 
     try:
         async with _client(timeout=15.0) as c:
             resp = await c.get(
-                f"{_gamma_base()}/markets",
+                _gamma_url("/markets"),
                 params={"active": "true", "closed": "false", "_limit": 5, "tag_slug": "tennis"},
             )
             result["http_status"] = resp.status_code

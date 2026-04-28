@@ -23,7 +23,7 @@ from app.models.player import Player
 from app.models.alert import BotSettings
 from app.collectors.tennis_live import fetch_all_today, fetch_upcoming_matches
 from app.collectors.elo_collector import refresh_elo, find_player_by_name
-from app.collectors.polymarket import fetch_match_price
+from app.collectors.polymarket import fetch_match_price, batch_fetch_prices
 from app.analyzers.opportunity_detector import process_live_match
 from app.bot.telegram_bot import send_opportunity_alert
 
@@ -255,9 +255,17 @@ def _build_live_notification(header: str, raw: dict, match) -> str:
 # ---------------------------------------------------------------------------
 
 async def job_fetch_polymarket():
-    """Update Polymarket prices for all live matches using fuzzy name search."""
+    """Update Polymarket prices for all live matches.
+
+    Two-phase approach (learned from weather-arb-bot):
+    Phase 1 — Batch CLOB price fetch: for matches with a known token ID,
+               fetch ALL prices in one CLOB API call (most efficient).
+    Phase 2 — Per-match discovery: for unlinked matches, search Gamma API
+               by player name and store condition ID + token ID + slug.
+    """
     from app.bot.telegram_bot import broadcast_message
     from sqlalchemy.orm import selectinload
+
     async with AsyncSessionLocal() as db:
         result = await db.execute(
             select(Match)
@@ -266,32 +274,54 @@ async def job_fetch_polymarket():
         )
         matches = result.scalars().all()
 
+        now = datetime.now(timezone.utc)
+
+        # Phase 1: batch CLOB price fetch for already-linked matches
+        token_map = {
+            m.external_id: m.polymarket_token_id
+            for m in matches
+            if getattr(m, "polymarket_token_id", None)
+        }
+        if token_map:
+            batch_prices = await batch_fetch_prices(token_map)
+            for match in matches:
+                if match.external_id in batch_prices:
+                    match.last_poly_price_p1 = batch_prices[match.external_id]
+                    match.poly_updated_at = now
+
+        # Phase 2: discover / update unlinked matches one by one
         for match in matches:
             try:
                 if not match.player1 or not match.player2:
+                    continue
+                # Skip if already updated by batch phase
+                if getattr(match, "polymarket_token_id", None) and match.last_poly_price_p1 is not None:
                     continue
 
                 p1_name = match.player1.name
                 p2_name = match.player2.name
 
-                price, cid, slug = await fetch_match_price(
+                price, cid, slug, token_id = await fetch_match_price(
                     player1=p1_name,
                     player2=p2_name,
                     condition_id=match.polymarket_condition_id,
+                    token_id=getattr(match, "polymarket_token_id", None),
                 )
 
                 if price is not None:
                     match.last_poly_price_p1 = price
-                    match.poly_updated_at = datetime.now(timezone.utc)
+                    match.poly_updated_at = now
 
                 newly_linked = cid and not match.polymarket_condition_id
                 if newly_linked:
                     match.polymarket_condition_id = cid
                     if slug:
                         match.polymarket_slug = slug
+                    if token_id:
+                        match.polymarket_token_id = token_id
                     logger.info(
-                        f"Linked Polymarket market {cid} (slug={slug}) "
-                        f"to {p1_name} vs {p2_name}"
+                        f"Linked Polymarket market cid={cid} slug={slug} "
+                        f"token={token_id} → {p1_name} vs {p2_name}"
                     )
 
                 # Notify when Polymarket is first linked to a live match
@@ -311,7 +341,7 @@ async def job_fetch_polymarket():
                     asyncio.ensure_future(broadcast_message(msg))
 
             except Exception as e:
-                logger.debug(f"Polymarket update failed for match {match.id}: {e}")
+                logger.warning(f"Polymarket update failed for match {match.id}: {e}")
 
         await db.commit()
 
