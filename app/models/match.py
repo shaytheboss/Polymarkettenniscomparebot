@@ -38,6 +38,7 @@ class Match(Base):
 
     # Polymarket
     polymarket_condition_id = Column(String(80), nullable=True, index=True)
+    polymarket_slug = Column(String(200), nullable=True)
     last_poly_price_p1 = Column(Float, nullable=True)  # last known P(p1 wins) from PM
     poly_updated_at = Column(TIMESTAMP(timezone=True), nullable=True)
 

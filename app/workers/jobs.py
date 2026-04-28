@@ -208,9 +208,17 @@ async def _job_fetch_live_scores_inner():
 # ---------------------------------------------------------------------------
 
 def _poly_url(p1_name: str, p2_name: str) -> str:
+    """Generic Polymarket search URL (fallback when slug not available)."""
     last1 = p1_name.split()[-1]
     last2 = p2_name.split()[-1]
-    return f"https://polymarket.com/markets?search={last1}+{last2}&tag=tennis"
+    return f"https://polymarket.com/sports/tennis?q={last1}+{last2}"
+
+
+def _market_url(match, p1_name: str, p2_name: str) -> str:
+    """Direct market URL if slug known, otherwise generic search."""
+    if getattr(match, "polymarket_slug", None):
+        return f"https://polymarket.com/event/{match.polymarket_slug}"
+    return _poly_url(p1_name, p2_name)
 
 
 def _build_live_notification(header: str, raw: dict, match) -> str:
@@ -238,7 +246,7 @@ def _build_live_notification(header: str, raw: dict, match) -> str:
         f"📊 Score: {score}\n"
         f"ELO: {p1.split()[-1]} {p1_elo:.0f} vs {p2.split()[-1]} {p2_elo:.0f}"
         f"{poly_line}\n"
-        f"🔗 {_poly_url(p1, p2)}"
+        f"🔗 {_market_url(match, p1, p2)}"
     )
 
 
@@ -266,7 +274,7 @@ async def job_fetch_polymarket():
                 p1_name = match.player1.name
                 p2_name = match.player2.name
 
-                price, cid = await fetch_match_price(
+                price, cid, slug = await fetch_match_price(
                     player1=p1_name,
                     player2=p2_name,
                     condition_id=match.polymarket_condition_id,
@@ -279,11 +287,16 @@ async def job_fetch_polymarket():
                 newly_linked = cid and not match.polymarket_condition_id
                 if newly_linked:
                     match.polymarket_condition_id = cid
-                    logger.info(f"Linked Polymarket market {cid} to {p1_name} vs {p2_name}")
+                    if slug:
+                        match.polymarket_slug = slug
+                    logger.info(
+                        f"Linked Polymarket market {cid} (slug={slug}) "
+                        f"to {p1_name} vs {p2_name}"
+                    )
 
                 # Notify when Polymarket is first linked to a live match
                 if newly_linked and price is not None:
-                    poly_url = _poly_url(p1_name, p2_name)
+                    direct_url = _market_url(match, p1_name, p2_name)
                     p1_elo = match.p1_elo_at_match or 1500
                     p2_elo = match.p2_elo_at_match or 1500
                     msg = (
@@ -293,7 +306,7 @@ async def job_fetch_polymarket():
                         f"{p2_name.split()[-1]}: {(1-price)*100:.0f}%\n"
                         f"ELO: {p1_elo:.0f} vs {p2_elo:.0f}\n"
                         f"Score: {match.score_text or '—'}\n"
-                        f"🔗 {poly_url}"
+                        f"🔗 {direct_url}"
                     )
                     asyncio.ensure_future(broadcast_message(msg))
 

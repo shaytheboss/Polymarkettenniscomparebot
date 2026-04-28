@@ -54,14 +54,14 @@ async def send_opportunity_alert(opportunity, match, db) -> None:
 
     extra = opportunity.extra or {}
 
-    # Construct Polymarket search URL from player last names
+    # Use direct market URL if slug is known, otherwise generic search
     from app.utils.name_matcher import _last_name
-    last1 = _last_name(p1_name).replace(" ", "+")
-    last2 = _last_name(p2_name).replace(" ", "+")
-    poly_url = f"https://polymarket.com/markets?search={last1}+{last2}"
-    if match.polymarket_condition_id:
-        # If we have a condition ID, also include it in the search for precision
-        poly_url = f"https://polymarket.com/markets?search={last1}+{last2}&tag=tennis"
+    if getattr(match, "polymarket_slug", None):
+        poly_url = f"https://polymarket.com/event/{match.polymarket_slug}"
+    else:
+        last1 = _last_name(p1_name).replace(" ", "+")
+        last2 = _last_name(p2_name).replace(" ", "+")
+        poly_url = f"https://polymarket.com/sports/tennis?q={last1}+{last2}"
 
     text = fmt_opportunity(
         match_name=f"{p1_name} vs {p2_name}",
