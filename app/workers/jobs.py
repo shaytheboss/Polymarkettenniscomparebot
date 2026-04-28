@@ -131,13 +131,20 @@ async def _job_fetch_live_scores_inner():
 
     async with AsyncSessionLocal() as db:
         for raw in raw_matches:
+            p1_name = raw["player1_name"]
+            p2_name = raw["player2_name"]
+
+            # Skip placeholder entries ESPN uses for unconfirmed bracket slots
+            if p1_name in ("TBD", "Unknown", "") or p2_name in ("TBD", "Unknown", ""):
+                continue
+
             ext_id = raw["external_id"]
             result = await db.execute(select(Match).where(Match.external_id == ext_id))
             match = result.scalar_one_or_none()
 
             if match is None:
-                p1 = await _resolve_player(raw["player1_name"], raw["tour"], db)
-                p2 = await _resolve_player(raw["player2_name"], raw["tour"], db)
+                p1 = await _resolve_player(p1_name, raw["tour"], db)
+                p2 = await _resolve_player(p2_name, raw["tour"], db)
                 match = Match(
                     external_id=ext_id,
                     player1_id=p1.id,
@@ -152,21 +159,20 @@ async def _job_fetch_live_scores_inner():
                 db.add(match)
                 await db.flush()
                 logger.info(
-                    f"NEW match: {raw['player1_name']} vs {raw['player2_name']} "
+                    f"NEW match: {p1_name} vs {p2_name} "
                     f"[{raw['tour']} | {raw['surface']} | {raw.get('tournament','')}] "
                     f"status={raw['status']}"
                 )
                 new_count += 1
-                icon = {"live": "🟢", "scheduled": "🕐", "finished": "✅"}.get(raw["status"], "❓")
-                new_match_lines.append(
-                    f"{icon} {raw['player1_name']} vs {raw['player2_name']} "
-                    f"({raw['tour']} | {raw['surface']})"
-                )
+                # Only notify about new LIVE matches (not the entire historical bracket)
+                if raw["status"] == "live":
+                    new_match_lines.append(
+                        f"🟢 {p1_name} vs {p2_name} ({raw['tour']} | {raw['surface']})"
+                    )
             else:
                 if match.status != "live" and raw["status"] == "live":
                     newly_live_lines.append(
-                        f"🟢 {raw['player1_name']} vs {raw['player2_name']} "
-                        f"({raw['tour']} | {raw['surface']})"
+                        f"🟢 {p1_name} vs {p2_name} ({raw['tour']} | {raw['surface']})"
                     )
                 updated_count += 1
 
@@ -324,31 +330,33 @@ async def job_mark_finished():
 async def _resolve_player(name: str, tour: str, db) -> Player:
     """
     Find a Player record by name using fuzzy matching.
-    Creates a new record with ELO=1500 if no match found.
-    Uses a savepoint to handle race conditions where the player was just inserted
-    (e.g. same player appears in multiple matches, or ESPN assigns wrong tour).
+    Creates a new stub with ELO=1500 if no match found anywhere.
+
+    Search order:
+      1. Exact name + tour match
+      2. Fuzzy name + tour match (catches typos/accent differences)
+      3. Exact name only (catches ESPN wrong-tour assignments, e.g. WTA player in ATP data)
+      4. Create new stub (safe: no IntegrityError because step 3 prevents duplicate names)
     """
+    # Step 1+2: fuzzy match within same tour
     player = await find_player_by_name(name, tour, db, fuzzy_threshold=0.80)
     if player:
         return player
 
-    # Not found — create a stub. ELO refresh will fill it in later.
+    # Step 3: exact name match ignoring tour
+    # Handles ESPN misassigning tour (e.g. 'Dominika Salkova' appearing as ATP)
+    result = await db.execute(select(Player).where(Player.name == name))
+    existing = result.scalar_one_or_none()
+    if existing:
+        logger.debug(
+            f"Player '{name}' found in DB as {existing.tour} "
+            f"(ESPN reported tour={tour}) — reusing existing record"
+        )
+        return existing
+
+    # Step 4: not found — create a stub; ELO refresh will fill it in later
     player = Player(name=name, tour=tour, current_elo=1500.0)
     db.add(player)
-    try:
-        async with db.begin_nested():  # savepoint — rollback only this INSERT on conflict
-            await db.flush()
-        logger.info(f"Created new player stub: {name} ({tour})")
-        return player
-    except Exception:
-        # Unique name constraint: player already exists (possibly with a different tour).
-        # ESPN sometimes assigns wrong tour (e.g. WTA player appearing in ATP data).
-        result = await db.execute(select(Player).where(Player.name == name))
-        existing = result.scalar_one_or_none()
-        if existing:
-            logger.debug(
-                f"Player '{name}' already in DB as {existing.tour} "
-                f"(requested {tour}) — reusing existing record"
-            )
-            return existing
-        raise
+    await db.flush()
+    logger.info(f"Created new player stub: {name} ({tour})")
+    return player
