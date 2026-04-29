@@ -98,9 +98,8 @@ def _client(timeout: float = 12.0) -> httpx.AsyncClient:
 
 async def fetch_clob_prices(token_ids: list[str]) -> dict[str, float]:
     """
-    Fetch current prices for multiple token IDs in one CLOB API call.
-    Returns dict: {token_id: price_float}.
-    Mirrors weather-arb-bot PolymarketCollector.get_prices().
+    Fetch current mid prices for multiple token IDs in one CLOB API call.
+    Returns dict: {token_id: mid_price_float}.
     """
     if not token_ids:
         return {}
@@ -122,6 +121,64 @@ async def fetch_clob_prices(token_ids: list[str]) -> dict[str, float]:
         _cache["last_error"] = f"CLOB {type(e).__name__}: {e}"
         logger.warning(f"CLOB /prices error: {type(e).__name__}: {e}")
         return {}
+
+
+async def fetch_last_trade_price(token_id: str) -> Optional[float]:
+    """
+    Fetch the price of the last executed trade for a token from the CLOB order book.
+    This is more accurate than the mid price — it reflects actual market activity.
+
+    Uses GET /last-trade-price?token_id=TOKEN_ID
+    Response: {"price": "0.65"} or {"price": null}
+    Falls back to order book mid if last-trade-price is unavailable.
+    """
+    try:
+        async with _client() as c:
+            resp = await c.get(
+                _clob_url("/last-trade-price"),
+                params={"token_id": token_id},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        price = data.get("price")
+        if price is not None:
+            return float(price)
+    except Exception:
+        pass
+
+    # Fallback: derive from order book best bid/ask midpoint
+    try:
+        async with _client() as c:
+            resp = await c.get(
+                _clob_url("/book"),
+                params={"token_id": token_id},
+            )
+            resp.raise_for_status()
+            book = resp.json()
+        bids = book.get("bids", [])
+        asks = book.get("asks", [])
+        if bids and asks:
+            best_bid = float(bids[0]["price"])
+            best_ask = float(asks[0]["price"])
+            return round((best_bid + best_ask) / 2, 4)
+    except Exception as e:
+        logger.debug(f"CLOB order book fallback failed for {token_id[:12]}: {e}")
+
+    return None
+
+
+async def fetch_last_trade_prices(token_ids: list[str]) -> dict[str, float]:
+    """Fetch last trade prices for multiple token IDs concurrently."""
+    import asyncio
+    results = await asyncio.gather(
+        *[fetch_last_trade_price(t) for t in token_ids],
+        return_exceptions=True,
+    )
+    return {
+        tid: price
+        for tid, price in zip(token_ids, results)
+        if isinstance(price, float)
+    }
 
 
 # ---------------------------------------------------------------------------
