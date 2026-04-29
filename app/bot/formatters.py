@@ -39,6 +39,7 @@ def fmt_opportunity(
     p1_games: int = 0,
     p2_games: int = 0,
     polymarket_url: str = "",
+    last_trade_price: Optional[float] = None,
 ) -> str:
     cat_emoji = {"STRONG": "🔴", "MODERATE": "🟡", "WEAK": "🟢"}.get(edge_category, "⚪")
     surface_emoji = {"hard": "🔵", "clay": "🟤", "grass": "🟢"}.get(surface, "⚫")
@@ -61,6 +62,15 @@ def fmt_opportunity(
     # Kelly suggestion (simplified: edge / (1/poly_price - 1))
     kelly = _kelly_fraction(consensus_prob, poly_price)
 
+    # Build Polymarket price line — show last trade if available
+    if last_trade_price is not None:
+        poly_line = (
+            f"  Polymarket:   `{last_trade_price*100:.1f}%` \\(עסקה אחרונה\\)\n"
+            f"                `{poly_price*100:.1f}%` \\(mid\\)"
+        )
+    else:
+        poly_line = f"  Polymarket:   `{poly_price*100:.1f}%`"
+
     lines = [
         f"{cat_emoji} *EDGE DETECTED* {cat_emoji}",
         f"",
@@ -71,11 +81,13 @@ def fmt_opportunity(
         f"▶️ *Back: {_esc(back_player)}*",
         f"",
         f"━━━━━━━━━━━━━━━━━━━━━",
-        f"📐 *הסתברויות*",
-        f"  TABLE  model: `{table_prob*100:.1f}%` \\[empirical\\]",
-        f"  MARKOV model: `{markov_prob*100:.1f}%` \\[Markov chain\\]",
-        f"  Consensus:    `{consensus_prob*100:.1f}%`",
-        f"  Polymarket:   `{poly_price*100:.1f}%`",
+        f"📐 *הסתברויות — האלגוריתם שלנו*",
+        f"  TABLE  model: `{table_prob*100:.1f}%` \\[טבלאות אמפיריות\\]",
+        f"  MARKOV model: `{markov_prob*100:.1f}%` \\[שרשרת מרקוב\\]",
+        f"  ✅ Consensus:  `{consensus_prob*100:.1f}%` \\[ממוצע משוקלל\\]",
+        f"",
+        f"📉 *Polymarket — שוק*",
+        poly_line,
         f"",
         f"📈 *Edge: `{edge_pp:+.1f}pp`*",
         f"  קטגוריה: {_esc(edge_category)}",
@@ -197,19 +209,28 @@ def fmt_match_prob(
     surface: str,
     tour: str,
     table_notes: str = "",
+    last_trade_p1: Optional[float] = None,
 ) -> str:
     elo_gap = p1_elo - p2_elo
     surface_emoji = {"hard": "🔵", "clay": "🟤", "grass": "🟢"}.get(surface, "⚫")
 
-    poly_line = ""
+    poly_lines = ""
     edge_line = ""
     if poly_price_p1 is not None:
-        edge = (consensus_prob_p1 - poly_price_p1) * 100
+        # Use last trade price for edge calculation when available (more accurate)
+        ref_price = last_trade_p1 if last_trade_p1 is not None else poly_price_p1
+        edge = (consensus_prob_p1 - ref_price) * 100
         edge_emoji = "🔥" if abs(edge) >= 8 else ("⚡" if abs(edge) >= 5 else "")
-        poly_line = f"  Polymarket:  `{poly_price_p1*100:.1f}%`"
+        if last_trade_p1 is not None:
+            poly_lines = (
+                f"  עסקה אחרונה: `{last_trade_p1*100:.1f}%`\n"
+                f"  Mid price:   `{poly_price_p1*100:.1f}%`"
+            )
+        else:
+            poly_lines = f"  Polymarket:  `{poly_price_p1*100:.1f}%`"
         edge_line = f"  Edge: `{edge:+.1f}pp` {edge_emoji}"
     else:
-        poly_line = "  Polymarket:  _לא מקושר_"
+        poly_lines = "  Polymarket:  _לא מקושר_"
 
     return (
         f"🎾 *{_esc(match_name)}*\n"
@@ -217,11 +238,12 @@ def fmt_match_prob(
         f"Score: `{_esc(score_text)}`\n\n"
         f"*{_esc(p1_name)}* ELO `{p1_elo:.0f}` vs *{_esc(p2_name)}* ELO `{p2_elo:.0f}`\n"
         f"פער: `{elo_gap:+.0f}`\n\n"
-        f"*P\\({_esc(p1_name.split()[0])} מנצח\\)*\n"
+        f"📐 *האלגוריתם שלנו — P\\({_esc(p1_name.split()[0])} מנצח\\)*\n"
         f"  TABLE:       `{table_prob_p1*100:.1f}%`\n"
         f"  MARKOV:      `{markov_prob_p1*100:.1f}%`\n"
-        f"  Consensus:   `{consensus_prob_p1*100:.1f}%`\n"
-        f"{poly_line}\n"
+        f"  ✅ Consensus: `{consensus_prob_p1*100:.1f}%`\n\n"
+        f"📉 *Polymarket*\n"
+        f"{poly_lines}\n"
         f"{edge_line}\n"
         + (f"\n💬 _{_esc(table_notes)}_" if table_notes else "")
     )
