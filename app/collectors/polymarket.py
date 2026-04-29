@@ -1,10 +1,15 @@
 """
 Polymarket live price collector for tennis match markets.
 
-Architecture (learned from weather-arb-bot):
-  1. Market DISCOVERY  — Gamma API: search by player name, get conditionId + clobTokenIds + slug
+Architecture:
+  1. Market DISCOVERY  — Gamma API /events?tag_id=864  (NOT /markets?tag_slug=tennis)
   2. Price UPDATES     — CLOB API:  batch-fetch prices for all known token IDs in one call
                          Fallback:  Gamma API outcomePrices if CLOB is unavailable
+
+Key fix: the correct endpoint is /events?tag_id=864.
+  - /markets?tag_slug=tennis returns no results (wrong API path).
+  - /events returns event objects, each with a nested "markets" array.
+  - Market URL uses the EVENT slug: https://polymarket.com/event/{event_slug}
 
 CLOB API is faster and more efficient: one request fetches prices for all live matches.
 
@@ -14,8 +19,6 @@ IP blocking:
   The worker routes:
     /gamma/* → gamma-api.polymarket.com
     /clob/*  → clob.polymarket.com
-
-Market URL: https://polymarket.com/event/{slug}
 """
 from __future__ import annotations
 import json
@@ -125,39 +128,56 @@ async def fetch_clob_prices(token_ids: list[str]) -> dict[str, float]:
 # Gamma API market discovery
 # ---------------------------------------------------------------------------
 
-async def _fetch_markets_batch(tag_slug: Optional[str], limit: int = 200) -> list[dict]:
-    """Fetch a batch of active markets from the Gamma API."""
-    params: dict = {"active": "true", "closed": "false", "_limit": limit}
-    if tag_slug:
-        params["tag_slug"] = tag_slug
+async def _fetch_tennis_events(limit: int = 100) -> list[dict]:
+    """
+    Fetch active tennis markets via /events?tag_id=864.
+
+    The /events endpoint returns event objects with a nested "markets" array.
+    We flatten them into individual market dicts and attach _event_slug so we
+    can build the correct URL: https://polymarket.com/event/{_event_slug}.
+    """
+    params: dict = {"tag_id": 864, "active": "true", "closed": "false", "limit": limit}
 
     try:
         async with _client() as c:
-            resp = await c.get(_gamma_url("/markets"), params=params)
+            resp = await c.get(_gamma_url("/events"), params=params)
             resp.raise_for_status()
             data = resp.json()
-        return data if isinstance(data, list) else []
     except httpx.HTTPStatusError as e:
         _cache["last_error"] = f"Gamma HTTP {e.response.status_code}: {e.response.text[:60]}"
-        logger.warning(f"Polymarket Gamma API HTTP {e.response.status_code} (tag={tag_slug})")
+        logger.warning(f"Polymarket /events HTTP {e.response.status_code}")
         return []
     except Exception as e:
         _cache["last_error"] = f"Gamma {type(e).__name__}: {e}"
-        logger.warning(f"Polymarket Gamma API error (tag={tag_slug}): {e}")
+        logger.warning(f"Polymarket /events error: {e}")
         return []
+
+    events = data if isinstance(data, list) else data.get("data", [])
+    markets: list[dict] = []
+
+    for event in events:
+        event_slug = event.get("slug", "")
+        for item in event.get("markets", []):
+            # Attach event slug so fetch_match_price can build the correct URL
+            item = dict(item)
+            item["_event_slug"] = event_slug
+            # Populate homeTeam/awayTeam into question field if question is missing
+            if not item.get("question") and (item.get("homeTeam") or item.get("awayTeam")):
+                item["question"] = f"{item.get('homeTeam', '')} vs {item.get('awayTeam', '')}"
+            markets.append(item)
+
+    return markets
 
 
 async def _refresh_cache() -> list[dict]:
-    """Refresh market cache — try with tennis tag, then without."""
+    """Refresh market cache using /events?tag_id=864."""
     global _cache
 
-    markets = await _fetch_markets_batch(tag_slug="tennis", limit=200)
+    markets = await _fetch_tennis_events(limit=100)
     if markets:
-        logger.info(f"Polymarket cache: {len(markets)} markets (tag=tennis)")
-    if not markets:
-        markets = await _fetch_markets_batch(tag_slug=None, limit=100)
-        if markets:
-            logger.info(f"Polymarket cache: {len(markets)} markets (no tag)")
+        logger.info(f"Polymarket cache: {len(markets)} markets (tag_id=864, /events)")
+    else:
+        logger.warning("Polymarket cache: no tennis markets found via /events?tag_id=864")
 
     _cache["markets"] = markets
     _cache["fetched_at"] = time.time()
@@ -200,8 +220,18 @@ async def search_tennis_markets(player1: str, player2: str) -> list[dict]:
 
     scored = []
     for market in all_markets:
+        # Use homeTeam/awayTeam directly when available (more reliable than parsing question)
+        home = _normalize(market.get("homeTeam") or "")
+        away = _normalize(market.get("awayTeam") or "")
         question = _normalize(market.get("question", "") or market.get("title", ""))
-        score = _name_score(question, player1, player2)
+
+        if home and away:
+            # Score against homeTeam/awayTeam fields first
+            combined = f"{home} {away}"
+            score = _name_score(combined, player1, player2)
+        else:
+            score = _name_score(question, player1, player2)
+
         if score >= 1.0:
             scored.append((score, market))
 
@@ -343,7 +373,8 @@ async def fetch_match_price(
 
     best = markets[0]
     cid = best.get("conditionId") or best.get("condition_id")
-    slug = best.get("slug") or best.get("groupSlug")
+    # Use event slug (from parent event) for the correct market URL
+    slug = best.get("_event_slug") or best.get("slug") or best.get("groupSlug")
 
     player1_idx = _find_player1_idx(best, player1)
     token_ids = _extract_token_ids(best)
@@ -407,23 +438,27 @@ async def test_connectivity() -> dict:
         "markets_found": 0,
         "sample_question": None,
         "last_cache_error": _cache.get("last_error", ""),
-        "endpoint": _gamma_url("/markets"),
+        "endpoint": _gamma_url("/events"),
     }
 
     try:
         async with _client(timeout=15.0) as c:
             resp = await c.get(
-                _gamma_url("/markets"),
-                params={"active": "true", "closed": "false", "_limit": 5, "tag_slug": "tennis"},
+                _gamma_url("/events"),
+                params={"tag_id": 864, "active": "true", "closed": "false", "limit": 5},
             )
             result["http_status"] = resp.status_code
             if resp.status_code == 200:
                 data = resp.json()
-                markets = data if isinstance(data, list) else []
+                events = data if isinstance(data, list) else data.get("data", [])
+                # Count individual markets across all events
+                all_markets = [m for e in events for m in e.get("markets", [])]
                 result["ok"] = True
-                result["markets_found"] = len(markets)
-                if markets:
-                    result["sample_question"] = markets[0].get("question", "N/A")[:80]
+                result["markets_found"] = len(all_markets)
+                if all_markets:
+                    m = all_markets[0]
+                    q = m.get("question") or f"{m.get('homeTeam','')} vs {m.get('awayTeam','')}"
+                    result["sample_question"] = q[:80]
     except Exception as e:
         result["http_status"] = f"{type(e).__name__}: {e}"
 
