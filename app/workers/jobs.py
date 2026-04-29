@@ -23,7 +23,7 @@ from app.models.player import Player
 from app.models.alert import BotSettings
 from app.collectors.tennis_live import fetch_all_today, fetch_upcoming_matches
 from app.collectors.elo_collector import refresh_elo, find_player_by_name
-from app.collectors.polymarket import fetch_match_price, batch_fetch_prices
+from app.collectors.polymarket import fetch_match_price, batch_fetch_prices, fetch_last_trade_price
 from app.analyzers.opportunity_detector import process_live_match
 from app.bot.telegram_bot import send_opportunity_alert
 
@@ -309,7 +309,18 @@ async def job_fetch_polymarket():
                 )
 
                 if price is not None:
-                    match.last_poly_price_p1 = price
+                    # Prefer last trade price over mid price when token ID is known
+                    effective_price = price
+                    last_trade = None
+                    if token_id:
+                        last_trade = await fetch_last_trade_price(token_id)
+                        if last_trade is not None:
+                            effective_price = last_trade
+                            logger.debug(
+                                f"Last trade price for {p1_name}: {last_trade:.3f} "
+                                f"(mid was {price:.3f})"
+                            )
+                    match.last_poly_price_p1 = effective_price
                     match.poly_updated_at = now
 
                 newly_linked = cid and not match.polymarket_condition_id
@@ -329,11 +340,14 @@ async def job_fetch_polymarket():
                     direct_url = _market_url(match, p1_name, p2_name)
                     p1_elo = match.p1_elo_at_match or 1500
                     p2_elo = match.p2_elo_at_match or 1500
+                    display_price = effective_price if last_trade else price
+                    price_label = "עסקה אחרונה" if last_trade else "mid"
                     msg = (
                         f"💹 Polymarket נמצא!\n"
                         f"🎾 {p1_name} vs {p2_name}\n"
-                        f"💰 {p1_name.split()[-1]}: {price*100:.0f}% | "
-                        f"{p2_name.split()[-1]}: {(1-price)*100:.0f}%\n"
+                        f"💰 {p1_name.split()[-1]}: {display_price*100:.1f}% | "
+                        f"{p2_name.split()[-1]}: {(1-display_price)*100:.1f}%"
+                        f"  _({price_label})_\n"
                         f"ELO: {p1_elo:.0f} vs {p2_elo:.0f}\n"
                         f"Score: {match.score_text or '—'}\n"
                         f"🔗 {direct_url}"
