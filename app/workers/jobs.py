@@ -23,7 +23,7 @@ from app.models.player import Player
 from app.models.alert import BotSettings
 from app.collectors.tennis_live import fetch_all_today, fetch_upcoming_matches
 from app.collectors.elo_collector import refresh_elo, find_player_by_name
-from app.collectors.polymarket import fetch_match_price, batch_fetch_prices
+from app.collectors.polymarket import fetch_match_price, batch_fetch_prices, fetch_last_trade_price
 from app.analyzers.opportunity_detector import process_live_match
 from app.bot.telegram_bot import send_opportunity_alert
 
@@ -41,6 +41,7 @@ _DEFAULTS = {
 }
 
 _heartbeat_count = 0  # incremented each call; Telegram update every 6th (≈30 min)
+_last_match_state: dict[int, tuple] = {}  # match_id → (p1_sets, p2_sets, p1_games, p2_games)
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +251,47 @@ def _build_live_notification(header: str, raw: dict, match) -> str:
     )
 
 
+def _fmt_game_prob_update(match, calc_result) -> str:
+    """Format a per-game probability snapshot for debugging."""
+    if not match.player1 or not match.player2:
+        return ""
+
+    p1_name = match.player1.name
+    p2_name = match.player2.name
+    p1_short = p1_name.split()[-1]
+    p2_short = p2_name.split()[-1]
+
+    # calc_result is from the model's perspective where p1 = higher ELO
+    p1_elo = float(match.p1_elo_at_match or 1500)
+    p2_elo = float(match.p2_elo_at_match or 1500)
+    swapped = p2_elo > p1_elo
+
+    if swapped:
+        table_p1  = calc_result.table_model.p2_win_prob * 100
+        markov_p1 = calc_result.markov_model.p2_win_prob * 100
+        cons_p1   = (1.0 - calc_result.consensus_prob) * 100
+    else:
+        table_p1  = calc_result.table_model.p1_win_prob * 100
+        markov_p1 = calc_result.markov_model.p1_win_prob * 100
+        cons_p1   = calc_result.consensus_prob * 100
+
+    lines = [
+        f"📊 {p1_short} vs {p2_short} | {match.score_text or '—'}",
+        f"TABLE   {p1_short} {table_p1:.0f}% | {p2_short} {100-table_p1:.0f}%",
+        f"MARKOV  {p1_short} {markov_p1:.0f}% | {p2_short} {100-markov_p1:.0f}%",
+        f"Cons.   {p1_short} {cons_p1:.0f}% | {p2_short} {100-cons_p1:.0f}%",
+    ]
+
+    if match.last_poly_price_p1 is not None:
+        poly_p1 = match.last_poly_price_p1 * 100
+        edge_pp = cons_p1 - poly_p1
+        edge_sign = "+" if edge_pp >= 0 else ""
+        lines.append(f"Poly    {p1_short} {poly_p1:.0f}% | {p2_short} {100-poly_p1:.0f}%")
+        lines.append(f"Edge    {edge_sign}{edge_pp:.1f}pp")
+
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Polymarket price refresh
 # ---------------------------------------------------------------------------
@@ -309,7 +351,18 @@ async def job_fetch_polymarket():
                 )
 
                 if price is not None:
-                    match.last_poly_price_p1 = price
+                    # Prefer last trade price over mid price when token ID is known
+                    effective_price = price
+                    last_trade = None
+                    if token_id:
+                        last_trade = await fetch_last_trade_price(token_id)
+                        if last_trade is not None:
+                            effective_price = last_trade
+                            logger.debug(
+                                f"Last trade price for {p1_name}: {last_trade:.3f} "
+                                f"(mid was {price:.3f})"
+                            )
+                    match.last_poly_price_p1 = effective_price
                     match.poly_updated_at = now
 
                 newly_linked = cid and not match.polymarket_condition_id
@@ -329,11 +382,14 @@ async def job_fetch_polymarket():
                     direct_url = _market_url(match, p1_name, p2_name)
                     p1_elo = match.p1_elo_at_match or 1500
                     p2_elo = match.p2_elo_at_match or 1500
+                    display_price = effective_price if last_trade else price
+                    price_label = "עסקה אחרונה" if last_trade else "mid"
                     msg = (
                         f"💹 Polymarket נמצא!\n"
                         f"🎾 {p1_name} vs {p2_name}\n"
-                        f"💰 {p1_name.split()[-1]}: {price*100:.0f}% | "
-                        f"{p2_name.split()[-1]}: {(1-price)*100:.0f}%\n"
+                        f"💰 {p1_name.split()[-1]}: {display_price*100:.1f}% | "
+                        f"{p2_name.split()[-1]}: {(1-display_price)*100:.1f}%"
+                        f"  _({price_label})_\n"
                         f"ELO: {p1_elo:.0f} vs {p2_elo:.0f}\n"
                         f"Score: {match.score_text or '—'}\n"
                         f"🔗 {direct_url}"
@@ -353,6 +409,7 @@ async def job_fetch_polymarket():
 async def job_run_analyzer():
     """Run probability calculation and opportunity detection on all live matches."""
     from sqlalchemy.orm import selectinload
+    from app.bot.telegram_bot import broadcast_message
     async with AsyncSessionLocal() as db:
         result = await db.execute(
             select(Match)
@@ -371,7 +428,14 @@ async def job_run_analyzer():
                 if match.last_poly_price_p1 is None:
                     continue
 
-                new_opps = await process_live_match(match, db)
+                cur_state = (
+                    match.p1_sets or 0, match.p2_sets or 0,
+                    match.p1_games or 0, match.p2_games or 0,
+                )
+                last_state = _last_match_state.get(match.id)
+                game_changed = cur_state != last_state
+
+                new_opps, calc_result = await process_live_match(match, db)
                 await db.commit()
 
                 for opp in new_opps:
@@ -379,6 +443,14 @@ async def job_run_analyzer():
                         await send_opportunity_alert(opp, match, db)
                     except Exception as e:
                         logger.error(f"Alert send failed: {e}")
+
+                # Emit probability snapshot after every game end for debugging
+                if calc_result is not None and game_changed:
+                    _last_match_state[match.id] = cur_state
+                    msg = _fmt_game_prob_update(match, calc_result)
+                    if msg:
+                        asyncio.ensure_future(broadcast_message(msg))
+
             except Exception as e:
                 logger.error(f"Analyzer failed for match {match.id}: {e}", exc_info=True)
 

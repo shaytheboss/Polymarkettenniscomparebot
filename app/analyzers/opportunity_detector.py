@@ -55,15 +55,17 @@ def _kelly(prob: float, poly_price: float) -> float:
 async def process_live_match(
     match: Match,
     db: AsyncSession,
-) -> list[Opportunity]:
+):
     """
     Run probability calculation for a live match and detect opportunities.
-    Returns list of new Opportunity objects (already added to session).
+    Returns (list[Opportunity], DualModelResult | None).
+    DualModelResult is returned regardless of whether an edge was found,
+    so callers can show live probabilities for debugging.
     """
     if match.status != "live":
-        return []
+        return [], None
     if not match.player1 or not match.player2:
-        return []
+        return [], None
 
     p1 = match.player1
     p2 = match.player2
@@ -142,7 +144,7 @@ async def process_live_match(
     new_opportunities: list[Opportunity] = []
 
     if not result.is_opportunity or poly_price is None:
-        return new_opportunities
+        return (new_opportunities, result)
 
     edge_pp = abs(result.edge_consensus or 0) * 100
 
@@ -157,7 +159,7 @@ async def process_live_match(
         )
     )
     if existing.scalar_one_or_none():
-        return new_opportunities
+        return (new_opportunities, result)
 
     # Map direction back to original player ordering
     if result.opportunity_direction == "BACK_P1":
@@ -221,4 +223,4 @@ async def process_live_match(
         f"| kelly={kelly:.1%} | {match.score_text}"
     )
 
-    return new_opportunities
+    return (new_opportunities, result)

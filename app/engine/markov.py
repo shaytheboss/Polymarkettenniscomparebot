@@ -193,6 +193,14 @@ def _p_win_match_from(
                 p1_sets, p2_sets + 1, 0, 0, 0, 0, 1 - server,
                 p1_serve, p2_serve, False
             )
+        # Tiebreak deuce: (N,N) for N≥6 chains (N,N)→(N+1,N+1)→∞ because alternating
+        # serve means two split points always return to a balanced state. Closed-form:
+        # P(p1 wins | tied N-N, N≥6) = a*b / (a*b + (1-a)*(1-b))
+        # where a=p1_serve, b=1-p2_serve. Independent of current server.
+        if p1_pts == p2_pts and p1_pts >= 6:
+            a = p1_serve
+            b = 1.0 - p2_serve
+            return (a * b) / (a * b + (1.0 - a) * (1.0 - b))
         total = p1_pts + p2_pts
         next_server_tb = (1 - server) if (total >= 12 or total % 2 == 1) else server
         pw = _p_win_match_from(
@@ -205,55 +213,19 @@ def _p_win_match_from(
         )
         return p_win_pt * pw + (1 - p_win_pt) * pl
 
-    # Regular game: p1_pts/p2_pts are game points (0-3, deuce at 3-3)
-    sp = min(p1_pts if server == 0 else p2_pts, 3)
-    rp = min(p2_pts if server == 0 else p1_pts, 3)
-
-    if sp == 4:
-        # Current server won game
-        if server == 0:
-            new_p1g, new_p2g = p1_games + 1, p2_games
-        else:
-            new_p1g, new_p2g = p1_games, p2_games + 1
-        new_server = 1 - server
-        # Check set end
-        return _resolve_game_won(
-            p1_sets, p2_sets, new_p1g, new_p2g, new_server, p1_serve, p2_serve, server == 0
-        )
-    if rp == 4:
-        # Returner won game
-        if server == 0:
-            new_p1g, new_p2g = p1_games, p2_games + 1
-        else:
-            new_p1g, new_p2g = p1_games + 1, p2_games
-        new_server = 1 - server
-        return _resolve_game_won(
-            p1_sets, p2_sets, new_p1g, new_p2g, new_server, p1_serve, p2_serve, server != 0
-        )
-
-    # Normal game continuation
+    # Regular game: compute P(server wins this game) from current point score using
+    # _p_win_game_from which handles deuce with a closed-form (no infinite recursion).
+    # The old point-by-point recursion looped forever at states like (4,0) because
+    # sp=min(4,3)=3 made the sp==4 terminal unreachable.
     if server == 0:
-        new_p1p_w, new_p2p_w = min(p1_pts + 1, 4), p2_pts
-        new_p1p_l, new_p2p_l = p1_pts, min(p2_pts + 1, 4)
+        p_server_wins_game = _p_win_game_from(min(p1_pts, 3), min(p2_pts, 3), p1_serve)
+        pw = _resolve_game_won(p1_sets, p2_sets, p1_games + 1, p2_games, 1, p1_serve, p2_serve, True)
+        pl = _resolve_game_won(p1_sets, p2_sets, p1_games, p2_games + 1, 1, p1_serve, p2_serve, False)
     else:
-        new_p1p_w, new_p2p_w = p1_pts, min(p2_pts + 1, 4)
-        new_p1p_l, new_p2p_l = min(p1_pts + 1, 4), p2_pts
-
-    # Deuce handling: if both reach 3, stay at (3,3) until advantage
-    if new_p1p_w == 3 and new_p2p_w == 3:
-        new_p1p_w, new_p2p_w = 3, 3
-    if new_p1p_l == 3 and new_p2p_l == 3:
-        new_p1p_l, new_p2p_l = 3, 3
-
-    pw = _p_win_match_from(
-        p1_sets, p2_sets, p1_games, p2_games,
-        new_p1p_w, new_p2p_w, server, p1_serve, p2_serve, False
-    )
-    pl = _p_win_match_from(
-        p1_sets, p2_sets, p1_games, p2_games,
-        new_p1p_l, new_p2p_l, server, p1_serve, p2_serve, False
-    )
-    return p_win_pt * pw + (1 - p_win_pt) * pl
+        p_server_wins_game = _p_win_game_from(min(p2_pts, 3), min(p1_pts, 3), p2_serve)
+        pw = _resolve_game_won(p1_sets, p2_sets, p1_games, p2_games + 1, 0, p1_serve, p2_serve, False)
+        pl = _resolve_game_won(p1_sets, p2_sets, p1_games + 1, p2_games, 0, p1_serve, p2_serve, True)
+    return p_server_wins_game * pw + (1 - p_server_wins_game) * pl
 
 
 def _resolve_game_won(
@@ -351,17 +323,20 @@ def elo_to_serve_probs(
     elo_gap = elo1 - elo2
     p_match_target = 1.0 / (1.0 + 10 ** (-elo_gap / 400.0))
 
-    # Bisection: find δ such that compute_win_probability(base+δ, base-δ) ≈ p_match_target
+    # Bisection: find δ such that _p_win_match_from(base+δ, base-δ) ≈ p_match_target
     lo, hi = -0.20, 0.20
 
+    # Clear caches once before bisection; do NOT clear inside the loop —
+    # clearing mid-recursion is what caused the RecursionError.
+    _p_win_match_from.cache_clear()
+    _p_win_tiebreak_from.cache_clear()
+    _p_win_set_from.cache_clear()
+    _p_win_game_from.cache_clear()
+
     def _match_p(delta: float) -> float:
-        _p_win_match_from.cache_clear()
-        _p_win_set_from.cache_clear()
-        _p_win_game_from.cache_clear()
-        _p_win_tiebreak_from.cache_clear()
         p1s = max(0.30, min(0.85, base + delta))
         p2s = max(0.30, min(0.85, base - delta))
-        return compute_win_probability(p1s, p2s)
+        return _p_win_match_from(0, 0, 0, 0, 0, 0, 0, p1s, p2s, False)
 
     for _ in range(40):
         mid = (lo + hi) / 2
