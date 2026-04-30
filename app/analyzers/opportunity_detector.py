@@ -143,6 +143,19 @@ async def process_live_match(
 
     new_opportunities: list[Opportunity] = []
 
+    # Sanity check: an edge > 35pp almost always means the Polymarket token is
+    # assigned to the wrong player (inverted price).  Log a hard warning.
+    if poly_price is not None:
+        raw_edge = abs(result.consensus_prob - poly_price)
+        if raw_edge > 0.35:
+            logger.warning(
+                f"SUSPICIOUS EDGE {raw_edge*100:.0f}pp for "
+                f"{p1.name} vs {p2.name} — "
+                f"consensus={result.consensus_prob*100:.0f}% poly={poly_price*100:.0f}% "
+                f"swapped={swapped}. Polymarket token may be inverted. Skipping."
+            )
+            return (new_opportunities, result)
+
     if not result.is_opportunity or poly_price is None:
         return (new_opportunities, result)
 

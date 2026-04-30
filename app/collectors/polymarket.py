@@ -350,8 +350,31 @@ def _extract_token_ids(market: dict) -> list[str]:
     return [str(t) for t in raw] if isinstance(raw, list) else []
 
 
-def _find_player1_idx(market: dict, player1: str) -> int:
-    """Determine which outcome index corresponds to player1."""
+def _find_player1_idx(market: dict, player1: str, player2: str = "") -> int:
+    """
+    Determine which outcome index (0 or 1) corresponds to player1.
+
+    Priority:
+      1. homeTeam/awayTeam fields (explicit, reliable)
+      2. outcomes[] name matching
+      3. Default 0 with a warning
+    """
+    last1 = _last_name(player1)
+    last2 = _last_name(player2) if player2 else ""
+
+    # Priority 1: homeTeam/awayTeam — directly parallel to outcomes[0]/outcomes[1]
+    home = _normalize(market.get("homeTeam") or "")
+    away = _normalize(market.get("awayTeam") or "")
+    if home and away:
+        if last1 in home:
+            logger.debug(f"_find_player1_idx: homeTeam match → idx=0 ({player1})")
+            return 0
+        if last1 in away:
+            logger.debug(f"_find_player1_idx: awayTeam match → idx=1 ({player1})")
+            return 1
+        # Neither matched via homeTeam/awayTeam — fall through to outcomes
+
+    # Priority 2: outcomes[] name matching
     outcomes_raw = market.get("outcomes") or "[]"
     if isinstance(outcomes_raw, str):
         try:
@@ -361,11 +384,20 @@ def _find_player1_idx(market: dict, player1: str) -> int:
     else:
         outcomes = list(outcomes_raw)
 
-    last1 = _last_name(player1)
     for i, outcome_name in enumerate(outcomes):
         if last1 in _normalize(str(outcome_name)):
+            logger.debug(f"_find_player1_idx: outcomes[{i}] match → {outcome_name}")
             return i
-    return 0  # default: first outcome = player1
+
+    # Default — log a warning so we can catch wrong assignments
+    q = market.get("question") or market.get("title", "")
+    logger.warning(
+        f"_find_player1_idx: no outcome matched '{player1}' (last='{last1}') "
+        f"in market '{q[:60]}' outcomes={outcomes[:4]} "
+        f"homeTeam='{market.get('homeTeam','')}' awayTeam='{market.get('awayTeam','')}' "
+        f"— defaulting to idx=0 (may be WRONG)"
+    )
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -434,14 +466,31 @@ async def fetch_match_price(
     # Use event slug (from parent event) for the correct market URL
     slug = best.get("_event_slug") or best.get("slug") or best.get("groupSlug")
 
-    player1_idx = _find_player1_idx(best, player1)
+    player1_idx = _find_player1_idx(best, player1, player2)
     token_ids = _extract_token_ids(best)
     p1_token = token_ids[player1_idx] if len(token_ids) > player1_idx else None
+
+    outcomes_raw = best.get("outcomes") or "[]"
+    try:
+        outcomes_list = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else list(outcomes_raw)
+    except Exception:
+        outcomes_list = []
+    logger.info(
+        f"Polymarket link: {player1} vs {player2} → "
+        f"market='{best.get('question', best.get('title', ''))[:60]}' "
+        f"homeTeam='{best.get('homeTeam','')}' awayTeam='{best.get('awayTeam','')}' "
+        f"outcomes={outcomes_list[:4]} player1_idx={player1_idx} "
+        f"p1_token={str(p1_token)[:16] if p1_token else None}"
+    )
 
     # Try CLOB first (real-time price)
     if p1_token:
         prices = await fetch_clob_prices([p1_token])
         if p1_token in prices:
+            logger.info(
+                f"Polymarket CLOB price: {player1} → {prices[p1_token]*100:.1f}% "
+                f"(token idx={player1_idx})"
+            )
             return prices[p1_token], cid, slug, p1_token
 
     # Fall back to Gamma outcomePrices
