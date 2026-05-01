@@ -163,9 +163,18 @@ async def refresh_elo(tour: str, db: AsyncSession) -> int:
         player = result.scalar_one_or_none()
 
         if player is None:
+            # Try fuzzy match to find ESPN-created stubs (which may use different name format).
+            # Threshold 0.85 catches accent/spacing differences without false positives.
+            player = await find_player_by_name(row["name"], tour, db, fuzzy_threshold=0.85)
+
+        if player is None:
             player = Player(name=row["name"], tour=tour)
             player.name_last = _last_name(row["name"])
             db.add(player)
+        else:
+            # Ensure name_last is indexed (ESPN stubs created without it)
+            if not player.name_last:
+                player.name_last = _last_name(player.name)
 
         player.current_elo = row["elo"]
         if row["elo_hard"]:  player.elo_hard  = row["elo_hard"]

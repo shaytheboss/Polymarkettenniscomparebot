@@ -23,6 +23,7 @@ from app.models.player import Player
 from app.models.alert import BotSettings
 from app.collectors.tennis_live import fetch_all_today, fetch_upcoming_matches
 from app.collectors.elo_collector import refresh_elo, find_player_by_name
+from app.utils.name_matcher import _last_name
 from app.collectors.polymarket import fetch_match_price, batch_fetch_prices, fetch_last_trade_price
 from app.analyzers.opportunity_detector import process_live_match
 from app.bot.telegram_bot import send_opportunity_alert
@@ -331,7 +332,7 @@ async def job_fetch_polymarket():
             if getattr(m, "polymarket_token_id", None)
         }
         if token_map:
-            batch_prices = await batch_fetch_prices(token_map)
+            batch_prices, batch_ok = await batch_fetch_prices(token_map)
             updated_names = []
             for match in matches:
                 if match.external_id in batch_prices:
@@ -341,22 +342,21 @@ async def job_fetch_polymarket():
                     updated_names.append(f"{name}={batch_prices[match.external_id]*100:.0f}%")
             if updated_names:
                 logger.info(f"Batch CLOB prices updated: {', '.join(updated_names)}")
-            # Warn about any linked match that batch did NOT return a price for
-            for m in matches:
-                if getattr(m, "polymarket_token_id", None) and m.external_id not in batch_prices:
-                    name = m.player1.name.split()[-1] if m.player1 else m.external_id
-                    age_min = 999.0
-                    if m.poly_updated_at:
-                        ts = m.poly_updated_at
-                        if ts.tzinfo is None:
-                            from datetime import timezone as _tz
-                            ts = ts.replace(tzinfo=_tz.utc)
-                        age_min = (now - ts).total_seconds() / 60
-                    logger.warning(
-                        f"Batch CLOB returned no price for {name} "
-                        f"(token={str(m.polymarket_token_id)[:16]}, price age={age_min:.0f}min) "
-                        f"— will retry via Phase 2"
-                    )
+            # When the batch call succeeded but a known token returned no price, the token is
+            # stale (likely a V2 contract upgrade changed the token ID).  Clear it so Phase 2
+            # re-discovers the current token via Gamma API next cycle.
+            # Only do this when batch_ok=True — a network error must not wipe valid tokens.
+            if batch_ok:
+                for m in matches:
+                    if getattr(m, "polymarket_token_id", None) and m.external_id not in batch_prices:
+                        name = m.player1.name.split()[-1] if m.player1 else m.external_id
+                        logger.info(
+                            f"Stale Polymarket token for {name} — clearing for V2 re-discovery "
+                            f"(token={str(m.polymarket_token_id)[:16]})"
+                        )
+                        m.polymarket_token_id = None
+                        m.polymarket_condition_id = None
+                        m.polymarket_slug = None
 
         # Phase 2: discover / update matches not covered by batch
         for match in matches:
@@ -471,9 +471,11 @@ async def job_run_analyzer():
                     except Exception as e:
                         logger.error(f"Alert send failed: {e}")
 
-                # Emit probability snapshot after every game end for debugging
-                if calc_result is not None and game_changed:
+                # Always track state changes for dedup, but only broadcast
+                # the probability snapshot when an actual opportunity was found.
+                if game_changed:
                     _last_match_state[match.id] = cur_state
+                if new_opps and calc_result is not None:
                     msg = _fmt_game_prob_update(match, calc_result)
                     if msg:
                         asyncio.ensure_future(broadcast_message(msg))
@@ -555,6 +557,7 @@ async def _send_match_summary(
     from app.models.opportunity import Opportunity
 
     winner_name = p1_name if winner_player_id == p1_id else p2_name
+    winner_is_p1 = (winner_player_id == p1_id)
 
     async with AsyncSessionLocal() as db:
         opps_result = await db.execute(
@@ -568,36 +571,47 @@ async def _send_match_summary(
         for opp in opps:
             if not opp.resolved:
                 backed_p1 = (opp.back_player == 1)
-                winner_is_p1 = (winner_player_id == p1_id)
                 opp.outcome = "WIN" if (backed_p1 == winner_is_p1) else "LOSS"
                 opp.resolved = True
                 opp.resolved_at = now
+
+        # Snapshot data as plain values BEFORE commit — ORM objects expire after commit
+        # and accessing attributes outside the session causes DetachedInstanceError.
+        opp_rows = [
+            (
+                opp.outcome or "?",
+                opp.back_player_name or "?",
+                float(opp.consensus_prob or 0),
+                float(opp.poly_price or 0),
+                float(opp.edge_pp or 0),
+                opp.score_text or "",
+            )
+            for opp in opps
+        ]
         await db.commit()
 
-    if not opps:
-        return  # No opportunities for this match — no summary needed
+    if not opp_rows:
+        return
 
-    wins = sum(1 for o in opps if o.outcome == "WIN")
-    losses = sum(1 for o in opps if o.outcome == "LOSS")
+    wins   = sum(1 for outcome, *_ in opp_rows if outcome == "WIN")
+    losses = sum(1 for outcome, *_ in opp_rows if outcome == "LOSS")
 
     lines = [
         f"🏁 משחק הסתיים",
         f"🎾 {p1_name} vs {p2_name}",
         f"🏆 ניצח: {winner_name}  |  {score_text}",
         f"",
-        f"📊 הזדמנויות שזיהינו ({len(opps)}):",
+        f"📊 הזדמנויות שזיהינו ({len(opp_rows)}):",
     ]
-    for opp in opps:
-        icon = "✅ WIN" if opp.outcome == "WIN" else "❌ LOSS"
+    for outcome, back_name, cons_prob, poly_price, edge_pp, score in opp_rows:
+        icon = "✅ WIN" if outcome == "WIN" else "❌ LOSS"
+        lines.append(f"  {icon}  הימרנו: {back_name}")
         lines.append(
-            f"  {icon}  הימרנו: {opp.back_player_name}"
+            f"       Cons {cons_prob*100:.0f}% vs Poly {poly_price*100:.0f}%"
+            f"  |  Edge {edge_pp:+.1f}pp"
         )
-        lines.append(
-            f"       Cons {opp.consensus_prob*100:.0f}% vs Poly {opp.poly_price*100:.0f}%"
-            f"  |  Edge {opp.edge_pp:+.1f}pp"
-        )
-        if opp.score_text:
-            lines.append(f"       בניקוד: {opp.score_text}")
+        if score:
+            lines.append(f"       בניקוד: {score}")
     lines += [f"", f"📈 סה\"כ: {wins}✅  {losses}❌"]
 
     asyncio.ensure_future(broadcast_message("\n".join(lines)))
@@ -636,6 +650,7 @@ async def _resolve_player(name: str, tour: str, db) -> Player:
 
     # Step 4: not found — create a stub; ELO refresh will fill it in later
     player = Player(name=name, tour=tour, current_elo=1500.0)
+    player.name_last = _last_name(name)  # Required for fast ELO refresh lookups
     db.add(player)
     await db.flush()
     logger.info(f"Created new player stub: {name} ({tour})")

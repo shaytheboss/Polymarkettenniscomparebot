@@ -96,13 +96,16 @@ def _client(timeout: float = 12.0) -> httpx.AsyncClient:
 # CLOB price fetching (batch — one call for all token IDs)
 # ---------------------------------------------------------------------------
 
-async def fetch_clob_prices(token_ids: list[str]) -> dict[str, float]:
+async def fetch_clob_prices(token_ids: list[str]) -> tuple[dict[str, float], bool]:
     """
-    Fetch current mid prices for multiple token IDs in one CLOB API call.
-    Returns dict: {token_id: mid_price_float}.
+    Fetch current prices for multiple token IDs in one CLOB API call.
+    Returns (prices_dict, call_succeeded).
+    call_succeeded=True means the API responded; an empty dict with True means
+    the tokens are genuinely not in the order book (stale/invalid token IDs).
+    call_succeeded=False means a network or HTTP error — prices are unreliable.
     """
     if not token_ids:
-        return {}
+        return {}, True
     unique_ids = list(dict.fromkeys(token_ids))  # deduplicate, preserve order
     try:
         async with _client() as c:
@@ -113,25 +116,23 @@ async def fetch_clob_prices(token_ids: list[str]) -> dict[str, float]:
             resp.raise_for_status()
             data = resp.json()
         # Response: {"token_id_1": "0.65", "token_id_2": "0.35"}
-        return {k: float(v) for k, v in data.items() if v is not None}
+        return {k: float(v) for k, v in data.items() if v is not None}, True
     except httpx.HTTPStatusError as e:
         _cache["last_error"] = f"CLOB HTTP {e.response.status_code}: {e.response.text[:60]}"
         logger.warning(f"CLOB /prices HTTP {e.response.status_code}")
-        return {}
+        return {}, False
     except Exception as e:
         _cache["last_error"] = f"CLOB {type(e).__name__}: {e}"
         logger.warning(f"CLOB /prices error: {type(e).__name__}: {e}")
-        return {}
+        return {}, False
 
 
 async def fetch_last_trade_price(token_id: str) -> Optional[float]:
     """
-    Fetch the price of the last executed trade for a token from the CLOB order book.
-    This is more accurate than the mid price — it reflects actual market activity.
-
-    Uses GET /last-trade-price?token_id=TOKEN_ID
-    Response: {"price": "0.65"} or {"price": null}
-    Falls back to order book mid if last-trade-price is unavailable.
+    Fetch the last-trade price for a token. Three attempts in order:
+      1. GET /last-trade-price  (dedicated endpoint)
+      2. GET /book              (V2: last_trade_price embedded in response)
+      3. Compute mid from best bid/ask in the book as final fallback
     """
     try:
         async with _client() as c:
@@ -147,7 +148,7 @@ async def fetch_last_trade_price(token_id: str) -> Optional[float]:
     except Exception:
         pass
 
-    # Fallback: derive from order book best bid/ask midpoint
+    # Fallback: order book (V2 embeds last_trade_price directly in the book response)
     try:
         async with _client() as c:
             resp = await c.get(
@@ -156,6 +157,11 @@ async def fetch_last_trade_price(token_id: str) -> Optional[float]:
             )
             resp.raise_for_status()
             book = resp.json()
+        # V2: last_trade_price is a field on the book object
+        ltp = book.get("last_trade_price")
+        if ltp is not None:
+            return float(ltp)
+        # Final fallback: compute mid from best bid/ask
         bids = book.get("bids", [])
         asks = book.get("asks", [])
         if bids and asks:
@@ -447,7 +453,7 @@ async def fetch_match_price(
     """
     # Strategy 1: CLOB prices via token ID (fastest, learned from weather-arb-bot)
     if token_id:
-        prices = await fetch_clob_prices([token_id])
+        prices, _ = await fetch_clob_prices([token_id])
         if token_id in prices:
             return prices[token_id], condition_id, None, token_id
 
@@ -485,7 +491,7 @@ async def fetch_match_price(
 
     # Try CLOB first (real-time price)
     if p1_token:
-        prices = await fetch_clob_prices([p1_token])
+        prices, _ = await fetch_clob_prices([p1_token])
         if p1_token in prices:
             logger.info(
                 f"Polymarket CLOB price: {player1} → {prices[p1_token]*100:.1f}% "
@@ -502,7 +508,7 @@ async def fetch_match_price(
 # Batch price update — fetch ALL live match prices in one CLOB call
 # ---------------------------------------------------------------------------
 
-async def batch_fetch_prices(token_map: dict[str, str]) -> dict[str, float]:
+async def batch_fetch_prices(token_map: dict[str, str]) -> tuple[dict[str, float], bool]:
     """
     Fetch prices for multiple matches in a single CLOB API call.
 
@@ -510,19 +516,22 @@ async def batch_fetch_prices(token_map: dict[str, str]) -> dict[str, float]:
       token_map: {match_external_id: clob_token_id}
 
     Returns:
-      {match_external_id: price_float}
+      ({match_external_id: price_float}, call_succeeded)
+      call_succeeded=True + empty dict means tokens are stale/invalid in CLOB (V2 upgrade).
+      call_succeeded=False means a network/HTTP error — do NOT treat missing tokens as stale.
     """
     if not token_map:
-        return {}
+        return {}, True
 
     token_to_ext: dict[str, str] = {v: k for k, v in token_map.items()}
-    prices = await fetch_clob_prices(list(token_map.values()))
+    prices, ok = await fetch_clob_prices(list(token_map.values()))
 
-    return {
+    result = {
         token_to_ext[token]: price
         for token, price in prices.items()
         if token in token_to_ext
     }
+    return result, ok
 
 
 # ---------------------------------------------------------------------------
