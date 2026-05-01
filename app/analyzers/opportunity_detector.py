@@ -5,7 +5,7 @@ detect edges, persist opportunities, and return them for alerting.
 """
 from __future__ import annotations
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -161,14 +161,18 @@ async def process_live_match(
 
     edge_pp = abs(result.edge_consensus or 0) * 100
 
-    # Dedup: skip if same direction alerted recently
-    dedup_since = datetime.now(timezone.utc) - timedelta(minutes=settings.alert_dedup_minutes)
+    # Dedup: skip if same direction at the exact same game score was already recorded.
+    # Score-based (not time-based) so the same game state never creates two rows,
+    # but a new game with a persistent edge does create a fresh opportunity.
     back_player_num = 1 if result.opportunity_direction == "BACK_P1" else 2
     existing = await db.execute(
         select(Opportunity).where(
             Opportunity.match_id == match.id,
             Opportunity.back_player == back_player_num,
-            Opportunity.detected_at >= dedup_since,
+            Opportunity.p1_sets == match.p1_sets,
+            Opportunity.p2_sets == match.p2_sets,
+            Opportunity.p1_games == match.p1_games,
+            Opportunity.p2_games == match.p2_games,
         )
     )
     if existing.scalar_one_or_none():

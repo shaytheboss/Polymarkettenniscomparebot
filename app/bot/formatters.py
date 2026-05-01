@@ -46,92 +46,55 @@ def fmt_opportunity(
     tour_emoji = "👨" if tour == "ATP" else "👩"
     now = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
-    # ELO band explanation
-    band_explain = {
-        "E0": "שחקנים שקולים \\(פער ELO \\<50\\)",
-        "E1": "פוגשים בינוניים \\(פער 50\\-150\\)",
-        "E2": "מועדף ברור \\(פער 150\\-300\\) — אזור המספנות העיקרי",
-        "E3": "מועדף כבד מאוד \\(פער 300\\+\\)",
-    }.get(elo_band, elo_band)
-
-    # Identify which known edge type this is
-    edge_type_line = _classify_edge_type(
-        score_text, p1_sets, p2_sets, elo_band, surface
-    )
-
-    # Kelly suggestion (simplified: edge / (1/poly_price - 1))
+    edge_type_line = _classify_edge_type(score_text, p1_sets, p2_sets, elo_band, surface)
     kelly = _kelly_fraction(consensus_prob, poly_price)
+    agree_ok = model_agreement < 10
 
-    # Build Polymarket price line — show last trade if available
-    if last_trade_price is not None:
-        poly_line = (
-            f"  Polymarket:   `{last_trade_price*100:.1f}%` \\(עסקה אחרונה\\)\n"
-            f"                `{poly_price*100:.1f}%` \\(mid\\)"
-        )
-    else:
-        poly_line = f"  Polymarket:   `{poly_price*100:.1f}%`"
+    # Poly price display
+    poly_display = last_trade_price if last_trade_price is not None else poly_price
+    poly_label = "עסקה אחרונה" if last_trade_price is not None else "Polymarket"
 
     lines = [
-        f"{cat_emoji} *EDGE DETECTED* {cat_emoji}",
-        f"",
+        # ── Header ──────────────────────────────────────
+        f"{cat_emoji} *{_esc(edge_category)} EDGE* {cat_emoji}",
         f"{tour_emoji} {_esc(tournament)} \\| {surface_emoji} {_esc(surface.capitalize())}",
-        f"🎾 *{_esc(match_name)}*",
-        f"📊 Score: `{_esc(score_text)}`",
+        f"🎾 *{_esc(match_name)}*  \\|  `{_esc(score_text)}`",
         f"",
-        f"▶️ *Back: {_esc(back_player)}*",
-        f"",
+        # ── THE ACTION — most prominent ─────────────────
         f"━━━━━━━━━━━━━━━━━━━━━",
-        f"📐 *הסתברויות — האלגוריתם שלנו*",
-        f"  TABLE  model: `{table_prob*100:.1f}%` \\[טבלאות אמפיריות\\]",
-        f"  MARKOV model: `{markov_prob*100:.1f}%` \\[שרשרת מרקוב\\]",
-        f"  ✅ Consensus:  `{consensus_prob*100:.1f}%` \\[ממוצע משוקלל\\]",
-        f"",
-        f"📉 *Polymarket — שוק*",
-        poly_line,
-        f"",
-        f"📈 *Edge: `{edge_pp:+.1f}pp`*",
-        f"  קטגוריה: {_esc(edge_category)}",
-        f"  פער בין מודלים: `{model_agreement:.1f}pp` \\({'✅ מסכימים' if model_agreement < 10 else '⚠️ פחות בטוח'}\\)",
-        f"",
+        f"🎯 *הימר על: {_esc(back_player)}*",
+        f"   קנה ב\\-Polymarket: `{poly_display*100:.1f}%`  →  אנחנו: `{consensus_prob*100:.1f}%`",
+        f"   Edge: `{edge_pp:+.1f}pp`  \\|  Kelly: `{kelly:.1%}`",
         f"━━━━━━━━━━━━━━━━━━━━━",
-        f"📊 *פרטי שחקנים*",
-        f"  Band ELO: `{_esc(elo_band)}` — {band_explain}",
-        f"  פער ELO: `{elo_gap:+.0f}` נקודות",
+        f"",
+        # ── Model breakdown ─────────────────────────────
+        f"📐 *ניתוח שני המודלים:*",
+        f"  TABLE `{table_prob*100:.0f}%` — טבלאות ניצחון מ\\-50K משחקים היסטוריים",
+        f"  MARKOV `{markov_prob*100:.0f}%` — סימולציית נקודה\\-אחר\\-נקודה לפי ELO",
+        f"  ✅ Consensus `{consensus_prob*100:.0f}%` — {'✅ שני מודלים מסכימים' if agree_ok else '⚠️ מודלים חלוקים — פחות בטוח'}",
+        f"",
+        f"  {_esc(poly_label)}: `{poly_display*100:.1f}%`"
+        + (f"  _\\(mid: {poly_price*100:.1f}%\\)_" if last_trade_price is not None else ""),
     ]
 
     if edge_type_line:
         lines += [
             f"",
-            f"🔍 *סוג Edge מזוהה*",
-            f"  {_esc(edge_type_line)}",
+            f"🔍 {_esc(edge_type_line)}",
         ]
 
     if table_notes:
-        lines += [
-            f"",
-            f"💬 *מצב במשחק*: _{_esc(table_notes)}_",
-        ]
+        lines += [f"💬 _{_esc(table_notes)}_"]
 
     lines += [
         f"",
-        f"━━━━━━━━━━━━━━━━━━━━━",
-        f"💰 *Kelly fraction מוצע: `{kelly:.1%}`*",
-        f"  \\(מחושב על בסיס edge ומחיר Poly\\)",
-        f"",
-        f"⏰ {_esc(now)}",
+        f"  פער ELO: `{elo_gap:+.0f}` \\({_esc(elo_band)}\\)  \\|  ⏰ {_esc(now)}",
     ]
 
     if polymarket_url:
-        lines += [
-            f"",
-            f"🔗 [פתח ב\\-Polymarket]({polymarket_url})",
-        ]
+        lines += [f"🔗 [פתח ב\\-Polymarket]({polymarket_url})"]
 
-    lines += [
-        f"",
-        f"⚠️ _בסיס סטטיסטי בלבד\\. לא המלצת השקעה\\._",
-        f"_בדוק פציעה / משטח / ELO אמיתי לפני פעולה\\._",
-    ]
+    lines += [f"⚠️ _סטטיסטיקה בלבד\\. לא המלצת השקעה\\._"]
 
     return "\n".join(lines)
 

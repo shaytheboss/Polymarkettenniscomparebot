@@ -97,7 +97,12 @@ async def job_heartbeat():
                 f"{live_icon} משחקים חיים: {live_n}\n"
                 f"📊 הזדמנויות היום: {opps_n}\n"
                 f"👥 שחקנים: ATP {atp_players} | WTA {wta_players}\n"
-                f"⚙️ ספים: edge≥{_DEFAULTS['min_edge_pp']}pp | gap≤{_DEFAULTS['max_model_gap_pp']}pp"
+                f"⚙️ ספים: edge≥{_DEFAULTS['min_edge_pp']}pp | gap≤{_DEFAULTS['max_model_gap_pp']}pp\n"
+                f"\n"
+                f"📐 מה המודלים אומרים:\n"
+                f"  TABLE — טבלאות ניצחון מ-50K משחקים היסטוריים. מדויק למצבי משחק מוכרים (1-0 סטים, 5-4 גיים וכד').\n"
+                f"  MARKOV — סימולציית נקודה-אחר-נקודה לפי ELO השחקנים. מגיב למצב הנוכחי בדיוק גבוה יותר.\n"
+                f"  Consensus — ממוצע משוקלל (45% TABLE + 55% MARKOV). זה מה שמשווים לפוליס."
             )
             asyncio.ensure_future(broadcast_message(msg))
         except Exception as e:
@@ -326,10 +331,15 @@ async def job_fetch_polymarket():
         }
         if token_map:
             batch_prices = await batch_fetch_prices(token_map)
+            updated_names = []
             for match in matches:
                 if match.external_id in batch_prices:
                     match.last_poly_price_p1 = batch_prices[match.external_id]
                     match.poly_updated_at = now
+                    name = (match.player1.name.split()[-1] if match.player1 else match.external_id)
+                    updated_names.append(f"{name}={batch_prices[match.external_id]*100:.0f}%")
+            if updated_names:
+                logger.info(f"Batch CLOB prices updated: {', '.join(updated_names)}")
 
         # Phase 2: discover / update unlinked matches one by one
         for match in matches:

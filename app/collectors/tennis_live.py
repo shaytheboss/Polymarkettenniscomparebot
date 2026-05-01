@@ -386,7 +386,7 @@ def _expand_espn_tournament(tournament: dict, tour: str) -> list[dict]:
         logger.debug(f"ESPN {tour} tournament '{tname}': has 0 groupings")
         return []
 
-    logger.info(
+    logger.debug(
         f"ESPN {tour} tournament '{tname}': {len(groupings)} grouping(s) — "
         f"round names={[g.get('name', g.get('shortName', '?')) for g in groupings]}"
     )
@@ -397,10 +397,10 @@ def _expand_espn_tournament(tournament: dict, tour: str) -> list[dict]:
         grp_events = grp.get("events") or grp.get("competitions") or []
 
         if not grp_events:
-            logger.info(f"  ESPN round '{grp_name}': 0 events (keys={list(grp.keys())})")
+            logger.debug(f"  ESPN round '{grp_name}': 0 events (keys={list(grp.keys())})")
             continue
 
-        logger.info(
+        logger.debug(
             f"  ESPN round '{grp_name}': {len(grp_events)} event(s), "
             f"first_keys={list(grp_events[0].keys())[:12]}"
         )
@@ -419,7 +419,7 @@ def _expand_espn_tournament(tournament: dict, tour: str) -> list[dict]:
                     f"ESPN {tour} round '{grp_name}' event {ev.get('id','?')}: {exc}"
                 )
 
-    logger.info(
+    logger.debug(
         f"ESPN {tour} tournament '{tname}': extracted {len(matches)} match(es)"
     )
     return matches
@@ -440,7 +440,7 @@ async def _fetch_espn(url: str, tour: str) -> list[dict]:
         logger.info(f"ESPN {tour}: 0 top-level events from {url}")
         return []
 
-    logger.info(
+    logger.debug(
         f"ESPN {tour}: {len(top_events)} top-level item(s) from {url}; "
         f"first_keys={list(top_events[0].keys())[:10]}"
     )
