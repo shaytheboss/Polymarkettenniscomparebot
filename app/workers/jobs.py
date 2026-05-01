@@ -324,6 +324,7 @@ async def job_fetch_polymarket():
         now = datetime.now(timezone.utc)
 
         # Phase 1: batch CLOB price fetch for already-linked matches
+        batch_prices: dict[str, float] = {}
         token_map = {
             m.external_id: m.polymarket_token_id
             for m in matches
@@ -340,14 +341,30 @@ async def job_fetch_polymarket():
                     updated_names.append(f"{name}={batch_prices[match.external_id]*100:.0f}%")
             if updated_names:
                 logger.info(f"Batch CLOB prices updated: {', '.join(updated_names)}")
+            # Warn about any linked match that batch did NOT return a price for
+            for m in matches:
+                if getattr(m, "polymarket_token_id", None) and m.external_id not in batch_prices:
+                    name = m.player1.name.split()[-1] if m.player1 else m.external_id
+                    age_min = 999.0
+                    if m.poly_updated_at:
+                        ts = m.poly_updated_at
+                        if ts.tzinfo is None:
+                            from datetime import timezone as _tz
+                            ts = ts.replace(tzinfo=_tz.utc)
+                        age_min = (now - ts).total_seconds() / 60
+                    logger.warning(
+                        f"Batch CLOB returned no price for {name} "
+                        f"(token={str(m.polymarket_token_id)[:16]}, price age={age_min:.0f}min) "
+                        f"— will retry via Phase 2"
+                    )
 
-        # Phase 2: discover / update unlinked matches one by one
+        # Phase 2: discover / update matches not covered by batch
         for match in matches:
             try:
                 if not match.player1 or not match.player2:
                     continue
-                # Skip if already updated by batch phase
-                if getattr(match, "polymarket_token_id", None) and match.last_poly_price_p1 is not None:
+                # Skip only if batch successfully updated this specific match
+                if match.external_id in batch_prices:
                     continue
 
                 p1_name = match.player1.name

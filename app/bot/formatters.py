@@ -58,23 +58,25 @@ def fmt_opportunity(
         # ── Header ──────────────────────────────────────
         f"{cat_emoji} *{_esc(edge_category)} EDGE* {cat_emoji}",
         f"{tour_emoji} {_esc(tournament)} \\| {surface_emoji} {_esc(surface.capitalize())}",
-        f"🎾 *{_esc(match_name)}*  \\|  `{_esc(score_text)}`",
+        f"🎾 *{_esc(match_name)}*",
+        f"📊 Score: `{_esc(score_text)}`",
         f"",
         # ── THE ACTION — most prominent ─────────────────
         f"━━━━━━━━━━━━━━━━━━━━━",
         f"🎯 *הימר על: {_esc(back_player)}*",
-        f"   קנה ב\\-Polymarket: `{poly_display*100:.1f}%`  →  אנחנו: `{consensus_prob*100:.1f}%`",
-        f"   Edge: `{edge_pp:+.1f}pp`  \\|  Kelly: `{kelly:.1%}`",
+        f"",
+        f"📉 Polymarket:  `{poly_display*100:.1f}%`"
+        + (f"  _\\(mid {poly_price*100:.1f}%\\)_" if last_trade_price is not None else ""),
+        f"📈 אנחנו:        `{consensus_prob*100:.1f}%`",
+        f"➡️ Edge:         `{edge_pp:+.1f}pp`",
+        f"💰 Kelly:        `{kelly:.1%}`",
         f"━━━━━━━━━━━━━━━━━━━━━",
         f"",
         # ── Model breakdown ─────────────────────────────
-        f"📐 *ניתוח שני המודלים:*",
-        f"  TABLE `{table_prob*100:.0f}%` — טבלאות ניצחון מ\\-50K משחקים היסטוריים",
-        f"  MARKOV `{markov_prob*100:.0f}%` — סימולציית נקודה\\-אחר\\-נקודה לפי ELO",
-        f"  ✅ Consensus `{consensus_prob*100:.0f}%` — {'✅ שני מודלים מסכימים' if agree_ok else '⚠️ מודלים חלוקים — פחות בטוח'}",
-        f"",
-        f"  {_esc(poly_label)}: `{poly_display*100:.1f}%`"
-        + (f"  _\\(mid: {poly_price*100:.1f}%\\)_" if last_trade_price is not None else ""),
+        f"📐 *ניתוח מודלים:*",
+        f"  TABLE:      `{table_prob*100:.0f}%`  — טבלאות ניצחון מ\\-50K משחקים",
+        f"  MARKOV:     `{markov_prob*100:.0f}%`  — סימולציה לפי ELO שחקנים",
+        f"  Consensus:  `{consensus_prob*100:.0f}%`  — {'✅ שניהם מסכימים' if agree_ok else '⚠️ מודלים חלוקים'}",
     ]
 
     if edge_type_line:

@@ -103,6 +103,19 @@ async def process_live_match(
     if swapped and poly_price is not None:
         poly_price = 1.0 - poly_price
 
+    # Warn if the stored Polymarket price is suspiciously old
+    if poly_price is not None and match.poly_updated_at:
+        ts = match.poly_updated_at
+        if ts.tzinfo is None:
+            from datetime import timezone as _tz
+            ts = ts.replace(tzinfo=_tz.utc)
+        age_min = (datetime.now(timezone.utc) - ts).total_seconds() / 60
+        if age_min > 3:
+            logger.warning(
+                f"Poly price for {p1.name} vs {p2.name} is {age_min:.0f}min old "
+                f"(val={poly_price*100:.1f}%) — may be stale, edge unreliable"
+            )
+
     result = calculate(
         state=state,
         polymarket_price=poly_price,
