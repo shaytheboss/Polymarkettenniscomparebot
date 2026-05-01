@@ -175,21 +175,26 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     async with AsyncSessionLocal() as db:
         user = await _get_or_create_user(chat_id, "", db)
+        min_cons_result = await db.execute(
+            select(BotSettings).where(BotSettings.key == "min_consensus_pct")
+        )
+        min_cons_setting = min_cons_result.scalar_one_or_none()
+        min_cons_pct = int(min_cons_setting.value) if min_cons_setting else 0
 
     tours_str = ", ".join(user.tours_watched) if user.tours_watched else "הכל"
-    edge_marker    = "" if user.min_edge_pp    == _DEFAULTS["min_edge_pp"]    else " ✏️"
-    gap_marker     = "" if user.min_model_agreement == _DEFAULTS["max_model_gap_pp"] else " ✏️"
+    edge_marker = "" if user.min_edge_pp == _DEFAULTS["min_edge_pp"] else " ✏️"
+    cons_label = f"{min_cons_pct}%\\+" if min_cons_pct > 0 else "ללא סף"
     await update.message.reply_text(
         f"*הגדרות שלך*\n\n"
-        f"פער מינימלי להתראה: `{user.min_edge_pp}pp`{edge_marker}\n"
-        f"פער מקסימלי בין מודלים: `{user.min_model_agreement}pp`{gap_marker}\n"
+        f"פער מינימלי \\(edge\\): `{user.min_edge_pp}pp`{edge_marker}\n"
+        f"הסתברות מינימלית שלנו: `{cons_label}`\n"
         f"טורים: `{tours_str}`\n\n"
-        f"*ברירות מחדל של המערכת:*\n"
-        f"  edge ≥ `{_DEFAULTS['min_edge_pp']}pp` "
-        f"\\| model gap ≤ `{_DEFAULTS['max_model_gap_pp']}pp` "
-        f"\\| dedup `{_DEFAULTS['alert_dedup_min']}min`\n\n"
-        f"שינוי:\n"
-        f"/set\\_edge 8 — פער מינימלי\n"
+        f"*ברירות מחדל:*\n"
+        f"  edge ≥ `{_DEFAULTS['min_edge_pp']}pp`"
+        f" \\| model gap ≤ `{_DEFAULTS['max_model_gap_pp']}pp`\n\n"
+        f"פקודות שינוי:\n"
+        f"/set\\_edge 8 — פער מינימלי מול Polymarket\n"
+        f"/set\\_min\\_prob 70 — הסתברות מינימלית שלנו \\(0 = הכל\\)\n"
         f"/set\\_tours ATP — ATP / WTA / ALL",
         parse_mode="MarkdownV2",
     )
@@ -209,6 +214,32 @@ async def cmd_set_edge(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         user.min_edge_pp = val
         await db.commit()
     await update.message.reply_text(f"✅ פער מינימלי הוגדר ל\\-`{val}pp`", parse_mode="MarkdownV2")
+
+
+async def cmd_set_min_prob(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set minimum consensus probability threshold (0 = no filter)."""
+    try:
+        val = int(ctx.args[0])
+        if not 0 <= val <= 99:
+            raise ValueError
+    except (IndexError, ValueError):
+        await update.message.reply_text(
+            "שימוש: /set\\_min\\_prob 70\n0 = ללא סף \\| 70 = רק כשאנחנו ≥70%",
+            parse_mode="MarkdownV2",
+        )
+        return
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(BotSettings).where(BotSettings.key == "min_consensus_pct"))
+        setting = result.scalar_one_or_none()
+        if setting:
+            setting.value = str(val)
+        else:
+            db.add(BotSettings(key="min_consensus_pct", value=str(val)))
+        await db.commit()
+    label = f"{val}%\\+" if val > 0 else "ללא סף"
+    await update.message.reply_text(
+        f"✅ הסתברות מינימלית שלנו: `{label}`", parse_mode="MarkdownV2"
+    )
 
 
 async def cmd_set_tours(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

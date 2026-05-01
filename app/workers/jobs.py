@@ -514,18 +514,93 @@ async def job_refresh_elo():
 
 async def job_mark_finished():
     """Mark matches whose set score shows a winner as finished."""
+    from sqlalchemy.orm import selectinload
     async with AsyncSessionLocal() as db:
-        result = await db.execute(select(Match).where(Match.status == "live"))
+        result = await db.execute(
+            select(Match)
+            .options(selectinload(Match.player1), selectinload(Match.player2))
+            .where(Match.status == "live")
+        )
         matches = result.scalars().all()
         now = datetime.now(timezone.utc)
+        just_finished = []
         for match in matches:
             if match.p1_sets == 2 or match.p2_sets == 2:
+                winner_id = match.player1_id if match.p1_sets == 2 else match.player2_id
                 match.status = "finished"
                 match.finished_at = now
-                match.winner_id = (
-                    match.player1_id if match.p1_sets == 2 else match.player2_id
-                )
+                match.winner_id = winner_id
+                just_finished.append((
+                    match.id, winner_id, match.player1_id,
+                    match.player1.name if match.player1 else "P1",
+                    match.player2.name if match.player2 else "P2",
+                    match.score_text or f"{match.p1_sets}-{match.p2_sets}",
+                ))
         await db.commit()
+
+    for args in just_finished:
+        asyncio.ensure_future(_send_match_summary(*args))
+
+
+async def _send_match_summary(
+    match_id: int,
+    winner_player_id: int,
+    p1_id: int,
+    p1_name: str,
+    p2_name: str,
+    score_text: str,
+) -> None:
+    """Resolve opportunity outcomes and broadcast match completion summary."""
+    from app.bot.telegram_bot import broadcast_message
+    from app.models.opportunity import Opportunity
+
+    winner_name = p1_name if winner_player_id == p1_id else p2_name
+
+    async with AsyncSessionLocal() as db:
+        opps_result = await db.execute(
+            select(Opportunity)
+            .where(Opportunity.match_id == match_id)
+            .order_by(Opportunity.detected_at)
+        )
+        opps = opps_result.scalars().all()
+
+        now = datetime.now(timezone.utc)
+        for opp in opps:
+            if not opp.resolved:
+                backed_p1 = (opp.back_player == 1)
+                winner_is_p1 = (winner_player_id == p1_id)
+                opp.outcome = "WIN" if (backed_p1 == winner_is_p1) else "LOSS"
+                opp.resolved = True
+                opp.resolved_at = now
+        await db.commit()
+
+    if not opps:
+        return  # No opportunities for this match — no summary needed
+
+    wins = sum(1 for o in opps if o.outcome == "WIN")
+    losses = sum(1 for o in opps if o.outcome == "LOSS")
+
+    lines = [
+        f"🏁 משחק הסתיים",
+        f"🎾 {p1_name} vs {p2_name}",
+        f"🏆 ניצח: {winner_name}  |  {score_text}",
+        f"",
+        f"📊 הזדמנויות שזיהינו ({len(opps)}):",
+    ]
+    for opp in opps:
+        icon = "✅ WIN" if opp.outcome == "WIN" else "❌ LOSS"
+        lines.append(
+            f"  {icon}  הימרנו: {opp.back_player_name}"
+        )
+        lines.append(
+            f"       Cons {opp.consensus_prob*100:.0f}% vs Poly {opp.poly_price*100:.0f}%"
+            f"  |  Edge {opp.edge_pp:+.1f}pp"
+        )
+        if opp.score_text:
+            lines.append(f"       בניקוד: {opp.score_text}")
+    lines += [f"", f"📈 סה\"כ: {wins}✅  {losses}❌"]
+
+    asyncio.ensure_future(broadcast_message("\n".join(lines)))
 
 
 # ---------------------------------------------------------------------------

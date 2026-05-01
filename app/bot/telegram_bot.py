@@ -10,7 +10,7 @@ from telegram.ext import Application, CommandHandler
 from app.config import settings
 from app.bot.handlers import (
     cmd_start, cmd_help, cmd_status, cmd_live,
-    cmd_opps, cmd_settings, cmd_set_edge, cmd_set_tours,
+    cmd_opps, cmd_settings, cmd_set_edge, cmd_set_min_prob, cmd_set_tours,
     cmd_refresh, cmd_track, cmd_polytest, cmd_setpoly,
 )
 from app.bot.formatters import fmt_opportunity
@@ -29,8 +29,9 @@ def get_app() -> Application:
         _app.add_handler(CommandHandler("live",       cmd_live))
         _app.add_handler(CommandHandler("opps",       cmd_opps))
         _app.add_handler(CommandHandler("settings",   cmd_settings))
-        _app.add_handler(CommandHandler("set_edge",   cmd_set_edge))
-        _app.add_handler(CommandHandler("set_tours",  cmd_set_tours))
+        _app.add_handler(CommandHandler("set_edge",     cmd_set_edge))
+        _app.add_handler(CommandHandler("set_min_prob", cmd_set_min_prob))
+        _app.add_handler(CommandHandler("set_tours",    cmd_set_tours))
         _app.add_handler(CommandHandler("refresh",    cmd_refresh))
         _app.add_handler(CommandHandler("track",      cmd_track))
         _app.add_handler(CommandHandler("polytest",   cmd_polytest))
@@ -89,6 +90,13 @@ async def send_opportunity_alert(opportunity, match, db) -> None:
         polymarket_url=poly_url,
     )
 
+    from app.models.alert import BotSettings as _BotSettings
+    min_cons_row = await db.execute(
+        select(_BotSettings).where(_BotSettings.key == "min_consensus_pct")
+    )
+    min_cons_setting = min_cons_row.scalar_one_or_none()
+    min_cons = float(min_cons_setting.value) / 100.0 if min_cons_setting else 0.0
+
     users_result = await db.execute(
         select(TelegramUser).where(TelegramUser.active == True)
     )
@@ -99,6 +107,8 @@ async def send_opportunity_alert(opportunity, match, db) -> None:
         if user.min_edge_pp and opportunity.edge_pp < user.min_edge_pp:
             continue
         if user.tours_watched and match.tour not in user.tours_watched:
+            continue
+        if min_cons > 0 and float(opportunity.consensus_prob) < min_cons:
             continue
         try:
             msg = await bot.send_message(
