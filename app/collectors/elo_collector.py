@@ -24,7 +24,13 @@ logger = logging.getLogger(__name__)
 ATP_ELO_URL = "https://tennisabstract.com/reports/atp_elo_ratings.html"
 WTA_ELO_URL = "https://tennisabstract.com/reports/wta_elo_ratings.html"
 
-_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; TennisArbBot/1.0)"}
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    )
+}
 
 
 def _clean_name(name: str) -> str:
@@ -72,18 +78,28 @@ async def _fetch_elo_page(url: str) -> list[dict]:
     # Name column
     name_idx = col_idx_exact(["player", "name"]) or col_idx_contains(["player", "name"])
 
-    # Overall ELO — must not be a surface-specific column
-    _surface_terms = ["hard", "clay", "grass", "carpet", "h.", "c.", "g."]
+    # Overall ELO — must not be a surface-specific column.
+    # _surface_terms covers all separator variants Tennis Abstract has ever used.
+    _surface_terms = ["hard", "clay", "grass", "carpet", "h.", "c.", "g.", "h-", "c-", "g-"]
     elo_idx = (
         col_idx_exact(["elo", "overall elo", "overall"])
         or col_idx_contains(["elo", "overall"], excludes=_surface_terms)
     )
 
-    # Surface ELOs — Tennis Abstract uses "helo"/"celo"/"gelo" column names
-    # Try abbreviated forms first (exact), then fall back to substring search
-    hard_idx  = col_idx_exact(["helo", "hard elo", "hard"]) or col_idx_contains(["helo", "hardelo"])
-    clay_idx  = col_idx_exact(["celo", "clay elo", "clay"]) or col_idx_contains(["celo", "clayelo"])
-    grass_idx = col_idx_exact(["gelo", "grass elo", "grass"]) or col_idx_contains(["gelo", "grasselo"])
+    # Surface ELOs — Tennis Abstract uses "H-Elo" / "C-Elo" / "G-Elo" (dash format).
+    # Also handle "H.Elo" (dot), bare "HElo", and plain English variants.
+    hard_idx = (
+        col_idx_exact(["h-elo", "helo", "h.elo", "hard elo", "hard"])
+        or col_idx_contains(["h-elo", "h.elo", "helo", "hardelo"])
+    )
+    clay_idx = (
+        col_idx_exact(["c-elo", "celo", "c.elo", "clay elo", "clay"])
+        or col_idx_contains(["c-elo", "c.elo", "celo", "clayelo"])
+    )
+    grass_idx = (
+        col_idx_exact(["g-elo", "gelo", "g.elo", "grass elo", "grass"])
+        or col_idx_contains(["g-elo", "g.elo", "gelo", "grasselo"])
+    )
 
     # Ranking — prefer ATP/WTA rank column over ELO rank column
     rank_idx = (
@@ -95,8 +111,14 @@ async def _fetch_elo_page(url: str) -> list[dict]:
 
     logger.info(
         f"ELO column indices — name:{name_idx} elo:{elo_idx} "
-        f"hard:{hard_idx} clay:{clay_idx} grass:{grass_idx} rank:{rank_idx}"
+        f"hard:{hard_idx} clay:{clay_idx} grass:{grass_idx} rank:{rank_idx} "
+        f"(headers={headers})"
     )
+    if hard_idx is None or clay_idx is None or grass_idx is None:
+        logger.warning(
+            f"Surface ELO columns not found — hard:{hard_idx} clay:{clay_idx} grass:{grass_idx}. "
+            f"Players will use overall ELO as fallback. Raw headers: {headers}"
+        )
 
     if name_idx is None or elo_idx is None:
         logger.warning(f"Cannot identify ELO columns. Headers: {headers}")
