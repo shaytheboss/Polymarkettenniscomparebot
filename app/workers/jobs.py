@@ -27,6 +27,7 @@ from app.utils.name_matcher import _last_name
 from app.collectors.polymarket import fetch_match_price, batch_fetch_prices, fetch_last_trade_price
 from app.analyzers.opportunity_detector import process_live_match
 from app.bot.telegram_bot import send_opportunity_alert
+from app.models.opportunity import Opportunity
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,11 @@ _DEFAULTS = {
 }
 
 _heartbeat_count = 0  # incremented each call; Telegram update every 6th (≈30 min)
-_last_match_state: dict[int, tuple] = {}  # match_id → (p1_sets, p2_sets, p1_games, p2_games)
+
+# Tracks edge_pp at the time of the last alert for each (match_id, back_player).
+# Used to suppress re-alerts when the edge hasn't changed materially.
+_last_alert_edge: dict[tuple[int, int], float] = {}
+MATERIAL_EDGE_CHANGE_PP = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -257,47 +262,6 @@ def _build_live_notification(header: str, raw: dict, match) -> str:
     )
 
 
-def _fmt_game_prob_update(match, calc_result) -> str:
-    """Format a per-game probability snapshot for debugging."""
-    if not match.player1 or not match.player2:
-        return ""
-
-    p1_name = match.player1.name
-    p2_name = match.player2.name
-    p1_short = p1_name.split()[-1]
-    p2_short = p2_name.split()[-1]
-
-    # calc_result is from the model's perspective where p1 = higher ELO
-    p1_elo = float(match.p1_elo_at_match or 1500)
-    p2_elo = float(match.p2_elo_at_match or 1500)
-    swapped = p2_elo > p1_elo
-
-    if swapped:
-        table_p1  = calc_result.table_model.p2_win_prob * 100
-        markov_p1 = calc_result.markov_model.p2_win_prob * 100
-        cons_p1   = (1.0 - calc_result.consensus_prob) * 100
-    else:
-        table_p1  = calc_result.table_model.p1_win_prob * 100
-        markov_p1 = calc_result.markov_model.p1_win_prob * 100
-        cons_p1   = calc_result.consensus_prob * 100
-
-    lines = [
-        f"📊 {p1_short} vs {p2_short} | {match.score_text or '—'}",
-        f"TABLE   {p1_short} {table_p1:.0f}% | {p2_short} {100-table_p1:.0f}%",
-        f"MARKOV  {p1_short} {markov_p1:.0f}% | {p2_short} {100-markov_p1:.0f}%",
-        f"Cons.   {p1_short} {cons_p1:.0f}% | {p2_short} {100-cons_p1:.0f}%",
-    ]
-
-    if match.last_poly_price_p1 is not None:
-        poly_p1 = match.last_poly_price_p1 * 100
-        edge_pp = cons_p1 - poly_p1
-        edge_sign = "+" if edge_pp >= 0 else ""
-        lines.append(f"Poly    {p1_short} {poly_p1:.0f}% | {p2_short} {100-poly_p1:.0f}%")
-        lines.append(f"Edge    {edge_sign}{edge_pp:.1f}pp")
-
-    return "\n".join(lines)
-
-
 # ---------------------------------------------------------------------------
 # Polymarket price refresh
 # ---------------------------------------------------------------------------
@@ -436,7 +400,6 @@ async def job_fetch_polymarket():
 async def job_run_analyzer():
     """Run probability calculation and opportunity detection on all live matches."""
     from sqlalchemy.orm import selectinload
-    from app.bot.telegram_bot import broadcast_message
     async with AsyncSessionLocal() as db:
         result = await db.execute(
             select(Match)
@@ -451,34 +414,42 @@ async def job_run_analyzer():
 
         for match in matches:
             try:
-                # Skip if no Polymarket price yet (no edge to detect)
                 if match.last_poly_price_p1 is None:
                     continue
 
-                cur_state = (
-                    match.p1_sets or 0, match.p2_sets or 0,
-                    match.p1_games or 0, match.p2_games or 0,
-                )
-                last_state = _last_match_state.get(match.id)
-                game_changed = cur_state != last_state
+                new_opps, updated_opps, _calc = await process_live_match(match, db)
 
-                new_opps, calc_result = await process_live_match(match, db)
+                # Snapshot ids + edge values before commit (ORM objects expire after commit)
+                new_snap    = [(o.id, o.back_player, float(o.edge_pp)) for o in new_opps]
+                updated_snap = [(o.id, o.back_player, float(o.edge_pp)) for o in updated_opps]
                 await db.commit()
 
-                for opp in new_opps:
-                    try:
-                        await send_opportunity_alert(opp, match, db)
-                    except Exception as e:
-                        logger.error(f"Alert send failed: {e}")
+                # New edge event — alert immediately (subject to per-user thresholds in send_opportunity_alert)
+                for opp_id, back_player, edge_pp in new_snap:
+                    opp = (await db.execute(
+                        select(Opportunity).where(Opportunity.id == opp_id)
+                    )).scalar_one_or_none()
+                    if opp:
+                        try:
+                            await send_opportunity_alert(opp, match, db)
+                        except Exception as e:
+                            logger.error(f"Alert send failed: {e}")
+                        _last_alert_edge[(match.id, back_player)] = edge_pp
 
-                # Always track state changes for dedup, but only broadcast
-                # the probability snapshot when an actual opportunity was found.
-                if game_changed:
-                    _last_match_state[match.id] = cur_state
-                if new_opps and calc_result is not None:
-                    msg = _fmt_game_prob_update(match, calc_result)
-                    if msg:
-                        asyncio.ensure_future(broadcast_message(msg))
+                # Continuing edge event — only re-alert when edge moved materially
+                for opp_id, back_player, edge_pp in updated_snap:
+                    key = (match.id, back_player)
+                    last = _last_alert_edge.get(key, edge_pp)
+                    if abs(edge_pp - last) >= MATERIAL_EDGE_CHANGE_PP:
+                        opp = (await db.execute(
+                            select(Opportunity).where(Opportunity.id == opp_id)
+                        )).scalar_one_or_none()
+                        if opp:
+                            try:
+                                await send_opportunity_alert(opp, match, db)
+                            except Exception as e:
+                                logger.error(f"Re-alert send failed: {e}")
+                            _last_alert_edge[key] = edge_pp
 
             except Exception as e:
                 logger.error(f"Analyzer failed for match {match.id}: {e}", exc_info=True)
@@ -541,6 +512,10 @@ async def job_mark_finished():
         await db.commit()
 
     for args in just_finished:
+        match_id = args[0]
+        # Clean up in-memory alert tracking so stale entries don't accumulate
+        for k in [k for k in _last_alert_edge if k[0] == match_id]:
+            del _last_alert_edge[k]
         asyncio.ensure_future(_send_match_summary(*args))
 
 

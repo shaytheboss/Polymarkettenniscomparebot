@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     live_scores_interval: int = 15     # how often to poll live scores
     elo_refresh_interval: int = 86400  # once per day
     polymarket_interval: int = 20
-    analyzer_interval: int = 30
+    analyzer_interval: int = 15        # match live_scores_interval to minimize score lag
 
     # Alert thresholds (defaults, can be overridden per user)
     default_min_edge_pp: float = 5.0

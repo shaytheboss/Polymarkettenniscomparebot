@@ -58,9 +58,14 @@ async def process_live_match(
 ):
     """
     Run probability calculation for a live match and detect opportunities.
-    Returns (list[Opportunity], DualModelResult | None).
-    DualModelResult is returned regardless of whether an edge was found,
-    so callers can show live probabilities for debugging.
+
+    Returns (new_opportunities, updated_opportunities, DualModelResult | None).
+      new_opportunities  — freshly created Opportunity rows (first detection of an edge).
+      updated_opportunities — existing Opportunity rows updated with latest score/edge.
+      DualModelResult    — returned regardless of edge, for callers that need probabilities.
+
+    One DB row per continuous edge event (not one per game).  Callers are
+    responsible for rate-limiting re-alerts for updated_opportunities.
     """
     if match.status != "live":
         return [], None
@@ -155,6 +160,7 @@ async def process_live_match(
     db.add(snapshot)
 
     new_opportunities: list[Opportunity] = []
+    updated_opportunities: list[Opportunity] = []
 
     # Sanity check: an edge > 35pp almost always means the Polymarket token is
     # assigned to the wrong player (inverted price).  Log a hard warning.
@@ -167,29 +173,12 @@ async def process_live_match(
                 f"consensus={result.consensus_prob*100:.0f}% poly={poly_price*100:.0f}% "
                 f"swapped={swapped}. Polymarket token may be inverted. Skipping."
             )
-            return (new_opportunities, result)
+            return (new_opportunities, updated_opportunities, result)
 
     if not result.is_opportunity or poly_price is None:
-        return (new_opportunities, result)
+        return (new_opportunities, updated_opportunities, result)
 
     edge_pp = abs(result.edge_consensus or 0) * 100
-
-    # Dedup: skip if same direction at the exact same game score was already recorded.
-    # Score-based (not time-based) so the same game state never creates two rows,
-    # but a new game with a persistent edge does create a fresh opportunity.
-    back_player_num = 1 if result.opportunity_direction == "BACK_P1" else 2
-    existing = await db.execute(
-        select(Opportunity).where(
-            Opportunity.match_id == match.id,
-            Opportunity.back_player == back_player_num,
-            Opportunity.p1_sets == match.p1_sets,
-            Opportunity.p2_sets == match.p2_sets,
-            Opportunity.p1_games == match.p1_games,
-            Opportunity.p2_games == match.p2_games,
-        )
-    )
-    if existing.scalar_one_or_none():
-        return (new_opportunities, result)
 
     # Map direction back to original player ordering
     if result.opportunity_direction == "BACK_P1":
@@ -212,45 +201,75 @@ async def process_live_match(
     )
     kelly = _kelly(opp_consensus, opp_poly)
 
-    opp = Opportunity(
-        match_id=match.id,
-        back_player=back_player,
-        back_player_name=back_name,
-        table_prob=opp_prob,
-        markov_prob=opp_markov,
-        consensus_prob=opp_consensus,
-        poly_price=opp_poly,
-        edge_pp=edge_pp,
-        model_agreement=result.model_agreement * 100,
-        elo_gap=elo_gap,
-        elo_band=band,
-        surface=match.surface,
-        tour=match.tour,
-        edge_category=_edge_category(edge_pp),
-        edge_type=edge_type,
-        p1_serve_prob=p1_serve,
-        p2_serve_prob=p2_serve,
-        kelly_fraction=kelly,
-        score_text=match.score_text,
-        p1_sets=match.p1_sets,
-        p2_sets=match.p2_sets,
-        p1_games=match.p1_games,
-        p2_games=match.p2_games,
-        extra={
-            "elo_band": band,
-            "table_notes": result.table_model.notes,
-            "surface": match.surface,
-            "tournament": match.tournament,
-            "edge_type": edge_type,
-        },
+    # One DB record per continuous edge event.  If an unresolved opportunity
+    # already exists for this player-direction, update it in place instead of
+    # inserting a new row every game.  Callers handle re-alert rate-limiting.
+    existing_result = await db.execute(
+        select(Opportunity).where(
+            Opportunity.match_id == match.id,
+            Opportunity.back_player == back_player,
+            Opportunity.resolved == False,  # noqa: E712
+        )
     )
-    db.add(opp)
-    new_opportunities.append(opp)
+    active_opp = existing_result.scalar_one_or_none()
 
-    logger.info(
-        f"OPPORTUNITY [{edge_type}]: {back_name} | edge={edge_pp:.1f}pp "
-        f"| consensus={opp_consensus*100:.1f}% vs poly={opp_poly*100:.1f}% "
-        f"| kelly={kelly:.1%} | {match.score_text}"
-    )
+    if active_opp is not None:
+        active_opp.score_text = match.score_text
+        active_opp.p1_sets = match.p1_sets
+        active_opp.p2_sets = match.p2_sets
+        active_opp.p1_games = match.p1_games
+        active_opp.p2_games = match.p2_games
+        active_opp.table_prob = opp_prob
+        active_opp.markov_prob = opp_markov
+        active_opp.consensus_prob = opp_consensus
+        active_opp.poly_price = opp_poly
+        active_opp.edge_pp = edge_pp
+        active_opp.edge_category = _edge_category(edge_pp)
+        active_opp.kelly_fraction = kelly
+        active_opp.model_agreement = result.model_agreement * 100
+        updated_opportunities.append(active_opp)
+        logger.debug(
+            f"Edge event update: {back_name} | edge={edge_pp:.1f}pp | {match.score_text}"
+        )
+    else:
+        opp = Opportunity(
+            match_id=match.id,
+            back_player=back_player,
+            back_player_name=back_name,
+            table_prob=opp_prob,
+            markov_prob=opp_markov,
+            consensus_prob=opp_consensus,
+            poly_price=opp_poly,
+            edge_pp=edge_pp,
+            model_agreement=result.model_agreement * 100,
+            elo_gap=elo_gap,
+            elo_band=band,
+            surface=match.surface,
+            tour=match.tour,
+            edge_category=_edge_category(edge_pp),
+            edge_type=edge_type,
+            p1_serve_prob=p1_serve,
+            p2_serve_prob=p2_serve,
+            kelly_fraction=kelly,
+            score_text=match.score_text,
+            p1_sets=match.p1_sets,
+            p2_sets=match.p2_sets,
+            p1_games=match.p1_games,
+            p2_games=match.p2_games,
+            extra={
+                "elo_band": band,
+                "table_notes": result.table_model.notes,
+                "surface": match.surface,
+                "tournament": match.tournament,
+                "edge_type": edge_type,
+            },
+        )
+        db.add(opp)
+        new_opportunities.append(opp)
+        logger.info(
+            f"OPPORTUNITY [new/{edge_type}]: {back_name} | edge={edge_pp:.1f}pp "
+            f"| consensus={opp_consensus*100:.1f}% vs poly={opp_poly*100:.1f}% "
+            f"| kelly={kelly:.1%} | {match.score_text}"
+        )
 
-    return (new_opportunities, result)
+    return (new_opportunities, updated_opportunities, result)
