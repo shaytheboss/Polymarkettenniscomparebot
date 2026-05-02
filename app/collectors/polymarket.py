@@ -174,6 +174,47 @@ async def fetch_last_trade_price(token_id: str) -> Optional[float]:
     return None
 
 
+async def fetch_best_ask(token_id: str) -> Optional[float]:
+    """
+    Fetch the best ask price for a token — the actual price you'd pay to buy YES.
+
+    Attempts in order:
+      1. GET /book  — reads asks[0].price (lowest offer in the order book)
+      2. GET /last-trade-price — last executed trade as fallback
+    """
+    try:
+        async with _client() as c:
+            resp = await c.get(
+                _clob_url("/book"),
+                params={"token_id": token_id},
+            )
+            resp.raise_for_status()
+            book = resp.json()
+        asks = book.get("asks", [])
+        if asks:
+            return float(asks[0]["price"])
+        # Book empty — fall through to last-trade fallback
+    except Exception as e:
+        logger.debug(f"CLOB /book failed for {token_id[:12]}: {e}")
+
+    # Fallback: last executed trade price
+    try:
+        async with _client() as c:
+            resp = await c.get(
+                _clob_url("/last-trade-price"),
+                params={"token_id": token_id},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        price = data.get("price")
+        if price is not None:
+            return float(price)
+    except Exception as e:
+        logger.debug(f"CLOB /last-trade-price failed for {token_id[:12]}: {e}")
+
+    return None
+
+
 async def fetch_last_trade_prices(token_ids: list[str]) -> dict[str, float]:
     """Fetch last trade prices for multiple token IDs concurrently."""
     import asyncio

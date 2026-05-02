@@ -42,9 +42,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     async with AsyncSessionLocal() as db:
         user = await _get_or_create_user(chat_id, username, db)
         is_new = user.created_at and (datetime.now(timezone.utc) - user.created_at).total_seconds() < 5
-    greeting = "ברוך הבא" if is_new else "ברוך השב"
+    greeting = "Welcome to" if is_new else "Welcome back to"
     await update.message.reply_text(
-        fmt_help().replace("*Tennis Arb Bot — עזרה*", f"*{greeting} ל\\-Tennis Arb Bot\\!*"),
+        fmt_help().replace("*Tennis Arb Bot — Help*", f"*{greeting} Tennis Arb Bot\\!*"),
         parse_mode="MarkdownV2",
     )
 
@@ -107,7 +107,7 @@ async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         matches = result.scalars().all()
 
     if not matches:
-        await update.message.reply_text("אין משחקים חיים כרגע\\.", parse_mode="MarkdownV2")
+        await update.message.reply_text("No live matches right now\\.", parse_mode="MarkdownV2")
         return
 
     for match in matches:
@@ -181,20 +181,20 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         min_cons_setting = min_cons_result.scalar_one_or_none()
         min_cons_pct = int(min_cons_setting.value) if min_cons_setting else 0
 
-    tours_str = ", ".join(user.tours_watched) if user.tours_watched else "הכל"
+    tours_str = ", ".join(user.tours_watched) if user.tours_watched else "ALL"
     edge_marker = "" if user.min_edge_pp == _DEFAULTS["min_edge_pp"] else " ✏️"
-    cons_label = f"{min_cons_pct}%\\+" if min_cons_pct > 0 else "ללא סף"
+    cons_label = f"{min_cons_pct}%\\+" if min_cons_pct > 0 else "no threshold"
     await update.message.reply_text(
-        f"*הגדרות שלך*\n\n"
-        f"פער מינימלי \\(edge\\): `{user.min_edge_pp}pp`{edge_marker}\n"
-        f"הסתברות מינימלית שלנו: `{cons_label}`\n"
-        f"טורים: `{tours_str}`\n\n"
-        f"*ברירות מחדל:*\n"
+        f"*Your Settings*\n\n"
+        f"Min edge: `{user.min_edge_pp}pp`{edge_marker}\n"
+        f"Min consensus prob: `{cons_label}`\n"
+        f"Tours: `{tours_str}`\n\n"
+        f"*Defaults:*\n"
         f"  edge ≥ `{_DEFAULTS['min_edge_pp']}pp`"
         f" \\| model gap ≤ `{_DEFAULTS['max_model_gap_pp']}pp`\n\n"
-        f"פקודות שינוי:\n"
-        f"/set\\_edge 8 — פער מינימלי מול Polymarket\n"
-        f"/set\\_min\\_prob 70 — הסתברות מינימלית שלנו \\(0 = הכל\\)\n"
+        f"Change settings:\n"
+        f"/set\\_edge 8 — min edge vs Polymarket\n"
+        f"/set\\_min\\_prob 70 — min consensus probability \\(0 = all\\)\n"
         f"/set\\_tours ATP — ATP / WTA / ALL",
         parse_mode="MarkdownV2",
     )
@@ -207,13 +207,15 @@ async def cmd_set_edge(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not 1 <= val <= 50:
             raise ValueError
     except (IndexError, ValueError):
-        await update.message.reply_text("שימוש: /set\\_edge 8 \\(מספר שלם 1\\-50\\)", parse_mode="MarkdownV2")
+        await update.message.reply_text(
+            "Usage: /set\\_edge 8 \\(integer 1\\-50\\)", parse_mode="MarkdownV2"
+        )
         return
     async with AsyncSessionLocal() as db:
         user = await _get_or_create_user(chat_id, "", db)
         user.min_edge_pp = val
         await db.commit()
-    await update.message.reply_text(f"✅ פער מינימלי הוגדר ל\\-`{val}pp`", parse_mode="MarkdownV2")
+    await update.message.reply_text(f"✅ Min edge set to `{val}pp`", parse_mode="MarkdownV2")
 
 
 async def cmd_set_min_prob(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -224,7 +226,7 @@ async def cmd_set_min_prob(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             raise ValueError
     except (IndexError, ValueError):
         await update.message.reply_text(
-            "שימוש: /set\\_min\\_prob 70\n0 = ללא סף \\| 70 = רק כשאנחנו ≥70%",
+            "Usage: /set\\_min\\_prob 70\n0 = no threshold \\| 70 = only when model ≥70%",
             parse_mode="MarkdownV2",
         )
         return
@@ -236,9 +238,9 @@ async def cmd_set_min_prob(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         else:
             db.add(BotSettings(key="min_consensus_pct", value=str(val)))
         await db.commit()
-    label = f"{val}%\\+" if val > 0 else "ללא סף"
+    label = f"{val}%\\+" if val > 0 else "no threshold"
     await update.message.reply_text(
-        f"✅ הסתברות מינימלית שלנו: `{label}`", parse_mode="MarkdownV2"
+        f"✅ Min consensus probability: `{label}`", parse_mode="MarkdownV2"
     )
 
 
@@ -253,29 +255,31 @@ async def cmd_set_tours(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             raise ValueError
     except (IndexError, ValueError):
-        await update.message.reply_text("שימוש: /set\\_tours ATP \\| WTA \\| ALL", parse_mode="MarkdownV2")
+        await update.message.reply_text(
+            "Usage: /set\\_tours ATP \\| WTA \\| ALL", parse_mode="MarkdownV2"
+        )
         return
     async with AsyncSessionLocal() as db:
         user = await _get_or_create_user(chat_id, "", db)
         user.tours_watched = tours
         await db.commit()
-    label = val if val != "ALL" else "הכל"
-    await update.message.reply_text(f"✅ טורים: `{label}`", parse_mode="MarkdownV2")
+    label = val if val != "ALL" else "ALL"
+    await update.message.reply_text(f"✅ Tours: `{label}`", parse_mode="MarkdownV2")
 
 
 async def cmd_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Force-fetch all sources now and show full diagnostic output."""
     from app.collectors.tennis_live import fetch_all_today
     await update.message.reply_text(
-        f"מריץ סריקה מלאה (Sofascore → ESPN → TheSportsDB)...\n"
-        f"ברירות מחדל: edge≥{_DEFAULTS['min_edge_pp']}pp | "
-        f"model_gap≤{_DEFAULTS['max_model_gap_pp']}pp | "
+        f"Running full scan (Sofascore -> ESPN -> TheSportsDB)...\n"
+        f"Defaults: edge>={_DEFAULTS['min_edge_pp']}pp | "
+        f"model_gap<={_DEFAULTS['max_model_gap_pp']}pp | "
         f"dedup={_DEFAULTS['alert_dedup_min']}min"
     )
     try:
         all_matches = await fetch_all_today()
     except Exception as exc:
-        await update.message.reply_text(f"שגיאה: {exc}")
+        await update.message.reply_text(f"Error: {exc}")
         return
 
     live      = [m for m in all_matches if m["status"] == "live"]
@@ -284,38 +288,36 @@ async def cmd_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not all_matches:
         await update.message.reply_text(
-            "⚠️ כל 3 המקורות החזירו 0 משחקים היום.\n"
-            "• Sofascore: 403 (Cloudflare חוסם IPs של Railway)\n"
-            "• ESPN: מחזיר מיכלי טורניר בלי משחקים בודדים\n"
-            "• TheSportsDB: גם כן ריק\n"
-            "בדוק שיש משחקים בפועל ב-tennisabstract.com"
+            "All 3 sources returned 0 matches today.\n"
+            "- Sofascore: 403 (Cloudflare blocks Railway IPs)\n"
+            "- ESPN: returns tournament containers without individual matches\n"
+            "- TheSportsDB: also empty\n"
+            "Check tennisabstract.com to confirm matches are actually running."
         )
         return
 
     lines = [
-        f"✅ סריקה הצליחה: {len(all_matches)} משחקים",
-        f"🟢 חיים: {len(live)}  🕐 מתוכננים: {len(scheduled)}  ✅ סיום: {len(finished)}",
+        f"Scan complete: {len(all_matches)} matches",
+        f"Live: {len(live)}  Scheduled: {len(scheduled)}  Finished: {len(finished)}",
         "",
     ]
 
-    # Show all matches, grouped by status
     shown = 0
     for m in (live + scheduled + finished):
         if shown >= 12:
-            lines.append(f"... ועוד {len(all_matches) - shown} משחקים")
+            lines.append(f"... and {len(all_matches) - shown} more")
             break
         icon = {"live": "🟢", "scheduled": "🕐", "finished": "✅"}.get(m["status"], "❓")
-        score = m.get("score_text") or "לא התחיל"
+        score = m.get("score_text") or "not started"
         src = m["external_id"].split("_")[0].upper()
         lines.append(
             f"{icon} [{src}] {m['player1_name']} vs {m['player2_name']} "
             f"({m['tour']} | {m['surface']})"
         )
-        if score and score != "לא התחיל":
-            lines.append(f"   ניקוד: {score}")
+        if score and score != "not started":
+            lines.append(f"   Score: {score}")
         shown += 1
 
-    # DB state
     async with AsyncSessionLocal() as db:
         db_live = (await db.execute(
             select(func.count()).select_from(Match).where(Match.status == "live")
@@ -332,7 +334,7 @@ async def cmd_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     lines += [
         "",
-        f"📊 DB: {db_live} חיים | {db_total} עודכנו היום | {db_opps} הזדמנויות",
+        f"DB: {db_live} live | {db_total} updated today | {db_opps} opportunities",
     ]
     await update.message.reply_text("\n".join(lines))
 
@@ -342,7 +344,7 @@ async def cmd_track(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = " ".join(ctx.args).strip() if ctx.args else ""
     if not query:
         await update.message.reply_text(
-            "שימוש: /track שם\\_שחקן\nדוגמה: /track Alcaraz",
+            "Usage: /track player\\_name\nExample: /track Alcaraz",
             parse_mode="MarkdownV2",
         )
         return
@@ -358,50 +360,50 @@ async def cmd_track(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not found:
         await update.message.reply_text(
-            f"לא נמצא '{query}' ב-ESPN.\n"
-            f"ESPN מציג {len(all_matches)} אירועים היום."
+            f"'{query}' not found in ESPN.\n"
+            f"ESPN shows {len(all_matches)} events today."
         )
         return
 
     for m in found[:3]:
         icon = {"live": "🟢", "finished": "✅", "scheduled": "🕐"}.get(m["status"], "❓")
-        score = m.get("score_text") or "לא התחיל"
+        score = m.get("score_text") or "not started"
         await update.message.reply_text(
             f"{icon} {m['player1_name']} vs {m['player2_name']}\n"
-            f"טור: {m['tour']} | מגרש: {m['surface']}\n"
-            f"ניקוד: {score}\n"
-            f"סטטוס: {m['status']}"
+            f"Tour: {m['tour']} | Surface: {m['surface']}\n"
+            f"Score: {score}\n"
+            f"Status: {m['status']}"
         )
 
 
 async def cmd_polytest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Test Polymarket API connectivity and show diagnostic information."""
-    await update.message.reply_text("🔍 בודק חיבור ל-Polymarket...")
+    await update.message.reply_text("Checking Polymarket connectivity...")
 
     from app.collectors.polymarket import test_connectivity
     diag = await test_connectivity()
 
     if diag.get("relay_configured"):
-        route_line = f"🔀 Relay: {diag['relay_hint']}"
+        route_line = f"Relay: {diag['relay_hint']}"
     elif diag.get("proxy_configured"):
-        route_line = f"🔀 Proxy: {diag['proxy_hint']}"
+        route_line = f"Proxy: {diag['proxy_hint']}"
     else:
-        route_line = "⚠️ אין Relay — Railway IPs חסומים ע\"י Polymarket"
+        route_line = "No relay configured — Railway IPs may be blocked by Polymarket"
 
-    endpoint_line = f"🌐 Endpoint: {diag.get('endpoint', '?')}"
+    endpoint_line = f"Endpoint: {diag.get('endpoint', '?')}"
 
     if diag["ok"]:
-        status_line = f"✅ API זמין — {diag['markets_found']} שווקי טניס"
-        sample_line = f"דוגמה: \"{diag['sample_question']}\"" if diag["sample_question"] else ""
+        status_line = f"API available — {diag['markets_found']} tennis markets"
+        sample_line = f"Sample: \"{diag['sample_question']}\"" if diag["sample_question"] else ""
     else:
-        status_line = f"❌ API חסום — {diag['http_status']}"
+        status_line = f"API blocked — HTTP {diag['http_status']}"
         sample_line = (
-            "\nפתרון חינמי (Cloudflare Worker):\n"
-            "1. cloudflare.com → Workers → Create Worker\n"
-            "2. הדבק את קוד cloudflare-worker.js מה-repo\n"
-            "3. Save & Deploy → קבל URL\n"
+            "\nFree fix (Cloudflare Worker):\n"
+            "1. cloudflare.com -> Workers -> Create Worker\n"
+            "2. Paste cloudflare-worker.js from the repo\n"
+            "3. Save & Deploy -> copy the worker URL\n"
             "4. Railway Variables: POLYMARKET_RELAY_URL=<url>\n"
-            "\nחלופה: /setpoly <שחקן> <condition_id>"
+            "\nAlternative: /setpoly <player> <condition_id>"
         )
 
     lines = [route_line, endpoint_line, status_line]
@@ -409,9 +411,8 @@ async def cmd_polytest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append(sample_line)
 
     if diag["last_cache_error"]:
-        lines.append(f"שגיאה אחרונה: {diag['last_cache_error'][:80]}")
+        lines.append(f"Last error: {diag['last_cache_error'][:80]}")
 
-    # Also show current live matches with Polymarket linkage status
     async with AsyncSessionLocal() as db:
         from sqlalchemy.orm import selectinload
         result = await db.execute(
@@ -423,16 +424,16 @@ async def cmd_polytest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         live = result.scalars().all()
 
     if live:
-        lines.append("\nמשחקים חיים:")
+        lines.append("\nLive matches:")
         for m in live:
             p1 = m.player1.name if m.player1 else "?"
             p2 = m.player2.name if m.player2 else "?"
             poly_status = (
-                f"✅ {m.last_poly_price_p1*100:.0f}%"
+                f"linked {m.last_poly_price_p1*100:.0f}%"
                 if m.last_poly_price_p1 is not None
-                else ("🔗 מקושר" if m.polymarket_condition_id else "❌ לא נמצא")
+                else ("linked (no price yet)" if m.polymarket_condition_id else "not found")
             )
-            lines.append(f"  {p1} vs {p2} → {poly_status}")
+            lines.append(f"  {p1} vs {p2} -> {poly_status}")
 
     await update.message.reply_text("\n".join(lines))
 
@@ -452,10 +453,10 @@ async def cmd_setpoly(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     args = ctx.args or []
     if len(args) < 2:
         await update.message.reply_text(
-            "שימוש: /setpoly <שחקן> <condition_id>\n\n"
-            "מצא את ה-condition_id בכתובת URL של השוק ב-Polymarket:\n"
+            "Usage: /setpoly <player> <condition_id>\n\n"
+            "Find the condition_id in the Polymarket market URL:\n"
             "https://polymarket.com/event/{slug}?tid={condition_id}\n\n"
-            "דוגמה:\n"
+            "Example:\n"
             "/setpoly Alcaraz 0x1234abcd..."
         )
         return
@@ -472,7 +473,6 @@ async def cmd_setpoly(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         live = result.scalars().all()
 
-    # Find matching live match
     match = None
     for m in live:
         p1 = m.player1.name if m.player1 else ""
@@ -487,12 +487,11 @@ async def cmd_setpoly(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             for m in live
         ]
         await update.message.reply_text(
-            f"לא נמצא משחק חי עם '{args[0]}'.\n"
-            f"משחקים חיים:\n" + "\n".join(f"  • {n}" for n in names) if names else "אין משחקים חיים."
+            f"No live match found with '{args[0]}'.\n"
+            + ("Live matches:\n" + "\n".join(f"  - {n}" for n in names) if names else "No live matches.")
         )
         return
 
-    # Update the match
     async with AsyncSessionLocal() as db:
         from sqlalchemy.orm import selectinload
         result = await db.execute(
@@ -502,11 +501,9 @@ async def cmd_setpoly(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         m = result.scalar_one()
         m.polymarket_condition_id = condition_id
-        # If it looks like a slug (not hex), also store as slug
         if not condition_id.startswith("0x"):
             m.polymarket_slug = condition_id
 
-        # Try to immediately fetch the price
         from app.collectors.polymarket import fetch_market_price
         price = await fetch_market_price(condition_id)
         if price is not None:
@@ -521,12 +518,12 @@ async def cmd_setpoly(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     if price is not None:
         await update.message.reply_text(
-            f"✅ {p1} vs {p2}\n"
-            f"Polymarket מקושר: {condition_id[:20]}...\n"
-            f"מחיר: {p1.split()[-1]} {price*100:.0f}% | {p2.split()[-1]} {(1-price)*100:.0f}%"
+            f"Linked: {p1} vs {p2}\n"
+            f"Condition ID: {condition_id[:20]}...\n"
+            f"Price: {p1.split()[-1]} {price*100:.0f}% | {p2.split()[-1]} {(1-price)*100:.0f}%"
         )
     else:
         await update.message.reply_text(
-            f"🔗 {p1} vs {p2} — condition ID נשמר: {condition_id[:20]}...\n"
-            f"⚠️ לא הצלחתי לקרוא מחיר. ודא שה-ID נכון ושה-API זמין."
+            f"Saved condition ID for {p1} vs {p2}: {condition_id[:20]}...\n"
+            f"Could not fetch price yet. Verify the ID is correct and the API is reachable."
         )

@@ -1,6 +1,6 @@
 """
-Telegram message formatters.
-All messages use MarkdownV2 — special chars must be escaped with backslash.
+Telegram message formatters — all English, MarkdownV2.
+Special chars must be escaped: _ * [ ] ( ) ~ ` > # + - = | { } . ! \
 """
 from __future__ import annotations
 from datetime import datetime, timezone
@@ -50,53 +50,46 @@ def fmt_opportunity(
     kelly = _kelly_fraction(consensus_prob, poly_price)
     agree_ok = model_agreement < 10
 
-    # Poly price display
+    # Use ask price when available (actual buying price), otherwise mid
     poly_display = last_trade_price if last_trade_price is not None else poly_price
-    poly_label = "עסקה אחרונה" if last_trade_price is not None else "Polymarket"
+    price_source = "ask" if last_trade_price is not None else "mid"
 
     lines = [
-        # ── Header ──────────────────────────────────────
         f"{cat_emoji} *{_esc(edge_category)} EDGE* {cat_emoji}",
         f"{tour_emoji} {_esc(tournament)} \\| {surface_emoji} {_esc(surface.capitalize())}",
         f"🎾 *{_esc(match_name)}*",
         f"📊 Score: `{_esc(score_text)}`",
         f"",
-        # ── THE ACTION — most prominent ─────────────────
         f"━━━━━━━━━━━━━━━━━━━━━",
-        f"🎯 *הימר על: {_esc(back_player)}*",
+        f"🎯 *BACK: {_esc(back_player)}*",
         f"",
-        f"📉 Polymarket:  `{poly_display*100:.1f}%`"
-        + (f"  _\\(mid {poly_price*100:.1f}%\\)_" if last_trade_price is not None else ""),
-        f"📈 אנחנו:        `{consensus_prob*100:.1f}%`",
-        f"➡️ Edge:         `{edge_pp:+.1f}pp`",
-        f"💰 Kelly:        `{kelly:.1%}`",
+        f"📉 Polymarket \\({_esc(price_source)}\\):  `{poly_display*100:.1f}%`",
+        f"📈 Our model:    `{consensus_prob*100:.1f}%`",
+        f"➡️ Edge:          `{edge_pp:+.1f}pp`",
+        f"💰 Kelly:         `{kelly:.1%}`",
         f"━━━━━━━━━━━━━━━━━━━━━",
         f"",
-        # ── Model breakdown ─────────────────────────────
-        f"📐 *ניתוח מודלים:*",
-        f"  TABLE:      `{table_prob*100:.0f}%`  — טבלאות ניצחון מ\\-50K משחקים",
-        f"  MARKOV:     `{markov_prob*100:.0f}%`  — סימולציה לפי ELO שחקנים",
-        f"  Consensus:  `{consensus_prob*100:.0f}%`  — {'✅ שניהם מסכימים' if agree_ok else '⚠️ מודלים חלוקים'}",
+        f"📐 *Model breakdown:*",
+        f"  TABLE:      `{table_prob*100:.0f}%`  empirical tables \\(50K matches\\)",
+        f"  MARKOV:     `{markov_prob*100:.0f}%`  point\\-by\\-point via ELO",
+        f"  Consensus:  `{consensus_prob*100:.0f}%`  {'✅ models agree' if agree_ok else '⚠️ models diverge'}",
     ]
 
     if edge_type_line:
-        lines += [
-            f"",
-            f"🔍 {_esc(edge_type_line)}",
-        ]
+        lines += [f"", f"🔍 {_esc(edge_type_line)}"]
 
     if table_notes:
         lines += [f"💬 _{_esc(table_notes)}_"]
 
     lines += [
         f"",
-        f"  פער ELO: `{elo_gap:+.0f}` \\({_esc(elo_band)}\\)  \\|  ⏰ {_esc(now)}",
+        f"  ELO gap: `{elo_gap:+.0f}` \\({_esc(elo_band)}\\)  \\|  ⏰ {_esc(now)}",
     ]
 
     if polymarket_url:
-        lines += [f"🔗 [פתח ב\\-Polymarket]({polymarket_url})"]
+        lines += [f"🔗 [Open on Polymarket]({polymarket_url})"]
 
-    lines += [f"⚠️ _סטטיסטיקה בלבד\\. לא המלצת השקעה\\._"]
+    lines += [f"⚠️ _Statistical signal only\\. Not investment advice\\._"]
 
     return "\n".join(lines)
 
@@ -104,22 +97,20 @@ def fmt_opportunity(
 def _classify_edge_type(
     score_text: str, p1_sets: int, p2_sets: int, elo_band: str, surface: str
 ) -> str:
-    """Identify which of the 3 documented edges this might be."""
     if elo_band in ("E2", "E3") and p1_sets == 0 and p2_sets == 1:
-        grass_warn = " ⚠️ משטח דשא מפחית comeback ב-3-5pp" if surface == "grass" else ""
-        return f"SET1_LOSS_HEAVY_FAV — מועדף כבד הפסיד סט 1. שוק מגיב יתר על המידה.{grass_warn}"
+        grass_warn = " ⚠️ Grass reduces comeback by 3\\-5pp" if surface == "grass" else ""
+        return f"SET1\\_LOSS\\_HEAVY\\_FAV — Heavy favourite lost set 1\\. Market overreacting\\.{grass_warn}"
     if "5-4" in score_text and p1_sets == 1 and p2_sets == 1:
-        return "SERVING_FOR_MATCH — מגיש למשחק. שוק מתמחר 'choke' שלא קיים סטטיסטית."
+        return "SERVING\\_FOR\\_MATCH — Serving for match\\. Market pricing choke that stats don't support\\."
     if p1_sets == 0 and p2_sets == 0:
-        return "PRE-MATCH EDGE — פער ELO לא משתקף במחיר Polymarket."
+        return "PRE\\-MATCH EDGE — ELO gap not reflected in Polymarket price\\."
     return ""
 
 
 def _kelly_fraction(prob: float, price: float) -> float:
-    """Full Kelly: (p*(1/price) - 1) / (1/price - 1), clamped to [0, 0.25]."""
     if price <= 0 or price >= 1:
         return 0.0
-    b = (1.0 / price) - 1.0  # decimal odds - 1
+    b = (1.0 / price) - 1.0
     q = 1.0 - prob
     kelly = (prob * b - q) / b
     return max(0.0, min(0.25, kelly))
@@ -138,25 +129,25 @@ def fmt_status(
     atp_players: int = 0,
     wta_players: int = 0,
 ) -> str:
-    status = "✅ פועל" if bot_running else "❌ מופסק"
+    status = "✅ Running" if bot_running else "❌ Stopped"
     return (
         f"*Tennis Arb Bot — Status*\n\n"
-        f"סטטוס: {status}\n\n"
-        f"*Live עכשיו*\n"
-        f"  משחקים מעוקבים: `{live_matches}`\n\n"
-        f"*היום*\n"
-        f"  הזדמנויות שזוהו: `{opportunities_today}`\n"
-        f"  חזקות \\(≥15pp\\): `{strong_today}`\n\n"
-        f"*נתוני ELO*\n"
-        f"  שחקני ATP: `{atp_players}`\n"
-        f"  שחקני WTA: `{wta_players}`\n"
-        f"  עדכון אחרון: `{_esc(last_elo_refresh or 'טרם בוצע')}`\n\n"
-        f"פקודות: /live /opps /settings /help"
+        f"Status: {status}\n\n"
+        f"*Live now*\n"
+        f"  Tracked matches: `{live_matches}`\n\n"
+        f"*Today*\n"
+        f"  Opportunities: `{opportunities_today}`\n"
+        f"  Strong \\(≥15pp\\): `{strong_today}`\n\n"
+        f"*ELO data*\n"
+        f"  ATP players: `{atp_players}`\n"
+        f"  WTA players: `{wta_players}`\n"
+        f"  Last refresh: `{_esc(last_elo_refresh or 'never')}`\n\n"
+        f"Commands: /live /opps /settings /help"
     )
 
 
 # ---------------------------------------------------------------------------
-# Live match probability card
+# Live match probability card  (/live command)
 # ---------------------------------------------------------------------------
 
 def fmt_match_prob(
@@ -178,38 +169,32 @@ def fmt_match_prob(
 ) -> str:
     elo_gap = p1_elo - p2_elo
     surface_emoji = {"hard": "🔵", "clay": "🟤", "grass": "🟢"}.get(surface, "⚫")
+    p1_short = p1_name.split()[-1]
 
-    poly_lines = ""
-    edge_line = ""
     if poly_price_p1 is not None:
-        # Use last trade price for edge calculation when available (more accurate)
-        ref_price = last_trade_p1 if last_trade_p1 is not None else poly_price_p1
-        edge = (consensus_prob_p1 - ref_price) * 100
+        ref = last_trade_p1 if last_trade_p1 is not None else poly_price_p1
+        edge = (consensus_prob_p1 - ref) * 100
         edge_emoji = "🔥" if abs(edge) >= 8 else ("⚡" if abs(edge) >= 5 else "")
-        if last_trade_p1 is not None:
-            poly_lines = (
-                f"  עסקה אחרונה: `{last_trade_p1*100:.1f}%`\n"
-                f"  Mid price:   `{poly_price_p1*100:.1f}%`"
-            )
-        else:
-            poly_lines = f"  Polymarket:  `{poly_price_p1*100:.1f}%`"
-        edge_line = f"  Edge: `{edge:+.1f}pp` {edge_emoji}"
+        price_label = "ask" if last_trade_p1 is not None else "mid"
+        poly_section = (
+            f"📉 *Polymarket*\n"
+            f"  Price \\({price_label}\\): `{ref*100:.1f}%`\n"
+            f"  Edge: `{edge:+.1f}pp` {edge_emoji}"
+        )
     else:
-        poly_lines = "  Polymarket:  _לא מקושר_"
+        poly_section = "📉 *Polymarket*\n  Not linked yet"
 
     return (
         f"🎾 *{_esc(match_name)}*\n"
         f"{surface_emoji} {_esc(surface.capitalize())} \\| {_esc(tour)} \\| Band: `{_esc(elo_band)}`\n"
         f"Score: `{_esc(score_text)}`\n\n"
         f"*{_esc(p1_name)}* ELO `{p1_elo:.0f}` vs *{_esc(p2_name)}* ELO `{p2_elo:.0f}`\n"
-        f"פער: `{elo_gap:+.0f}`\n\n"
-        f"📐 *האלגוריתם שלנו — P\\({_esc(p1_name.split()[0])} מנצח\\)*\n"
+        f"Gap: `{elo_gap:+.0f}`\n\n"
+        f"📐 *Our model — P\\({_esc(p1_short)} wins\\)*\n"
         f"  TABLE:       `{table_prob_p1*100:.1f}%`\n"
         f"  MARKOV:      `{markov_prob_p1*100:.1f}%`\n"
         f"  ✅ Consensus: `{consensus_prob_p1*100:.1f}%`\n\n"
-        f"📉 *Polymarket*\n"
-        f"{poly_lines}\n"
-        f"{edge_line}\n"
+        f"{poly_section}\n"
         + (f"\n💬 _{_esc(table_notes)}_" if table_notes else "")
     )
 
@@ -220,57 +205,54 @@ def fmt_match_prob(
 
 def fmt_help() -> str:
     return (
-        "*Tennis Arb Bot — עזרה*\n\n"
-        "*פקודות זמינות:*\n"
-        "/start — הרשמה לבוט\n"
-        "/status — סטטוס כללי\n"
-        "/live — משחקים חיים עם הסתברויות\n"
-        "/opps — הזדמנויות היום\n"
-        "/settings — הגדרות התראות שלך\n"
-        "/set\\_edge 8 — פער מינימלי לקבלת התראה \\(pp\\)\n"
-        "/set\\_tours ATP — סינון ATP/WTA/ALL\n"
-        "/refresh — סריקה מיידית של ESPN\n"
-        "/track שם — חפש שחקן ב\\-ESPN\n"
-        "/polytest — בדוק חיבור ל\\-Polymarket\n"
-        "/setpoly שחקן condition\\_id — קשר שוק Polymarket ידנית\n"
-        "/help — הודעה זו\n\n"
-        "*מה הבוט עושה:*\n"
-        "• עוקב אחרי משחקי ATP/WTA חיים דרך ESPN\n"
-        "• מחשב הסתברות ניצחון בשני מודלים:\n"
-        "  ─ TABLE: טבלאות אמפיריות \\(Sackmann/O'Shannessy\\)\n"
-        "  ─ MARKOV: שרשרת מרקוב point\\-by\\-point\n"
-        "• משווה ל\\-Polymarket ומתריע על פערים\n"
-        "• מעדכן ELO פעם ביום מ\\-Tennis Abstract\n\n"
+        "*Tennis Arb Bot — Help*\n\n"
+        "*Commands:*\n"
+        "/start — Register for alerts\n"
+        "/status — Bot status overview\n"
+        "/live — Live matches with probabilities\n"
+        "/opps — Today's opportunities\n"
+        "/settings — Your alert settings\n"
+        "/set\\_edge 8 — Min edge to receive alert \\(pp\\)\n"
+        "/set\\_min\\_prob 70 — Min consensus probability \\(0 = all\\)\n"
+        "/set\\_tours ATP — Filter ATP / WTA / ALL\n"
+        "/refresh — Force ESPN scan now\n"
+        "/track Name — Find player in ESPN\n"
+        "/polytest — Test Polymarket connectivity\n"
+        "/setpoly Player condition\\_id — Manually link Polymarket market\n"
+        "/help — This message\n\n"
+        "*What the bot does:*\n"
+        "• Tracks live ATP/WTA matches via ESPN\n"
+        "• Calculates win probability using two models:\n"
+        "  ─ TABLE: empirical tables \\(Sackmann/O'Shannessy\\)\n"
+        "  ─ MARKOV: point\\-by\\-point Markov chain\n"
+        "• Compares to Polymarket and alerts on mispricing\n"
+        "• Updates ELO once a day from Tennis Abstract\n\n"
         "*Edge categories:*\n"
         "🔴 STRONG ≥15pp\n"
         "🟡 MODERATE 8\\-15pp\n"
         "🟢 WEAK 5\\-8pp\n\n"
-        "*3 Edges מתועדים:*\n"
-        "1\\. מועדף כבד \\(E2/E3\\) הפסיד סט 1 — שוק מגיב יתר\n"
-        "2\\. WTA re\\-break — שוק מתמחר momentum שלא קיים\n"
-        "3\\. מגיש למשחק — שוק מתמחר choke שלא קיים לE2\\+\n\n"
-        "⚠️ _סטטיסטיקה בלבד\\. לא המלצת השקעה\\._"
+        "*3 documented edges:*\n"
+        "1\\. Heavy favourite \\(E2/E3\\) lost set 1 — market overreacts\n"
+        "2\\. WTA re\\-break — market prices momentum that doesn't exist\n"
+        "3\\. Serving for match — market prices a choke not supported by data\n\n"
+        "⚠️ _Statistical signal only\\. Not investment advice\\._"
     )
 
 
 # ---------------------------------------------------------------------------
-# Opportunity list summary
+# Opportunity list summary  (/opps command)
 # ---------------------------------------------------------------------------
 
 def fmt_opps_list(opps: list[dict]) -> str:
     if not opps:
-        return "אין הזדמנויות שזוהו היום עדיין\\."
+        return "No opportunities detected today yet\\."
 
     cat_emoji = {"STRONG": "🔴", "MODERATE": "🟡", "WEAK": "🟢"}
-    lines = [f"*הזדמנויות היום \\({len(opps)}\\)*\n"]
+    lines = [f"*Today's opportunities \\({len(opps)}\\)*\n"]
     for o in opps:
         em = cat_emoji.get(o.get("edge_category", ""), "⚪")
         outcome = o.get("outcome", "")
-        outcome_str = ""
-        if outcome == "WIN":
-            outcome_str = " ✅"
-        elif outcome == "LOSS":
-            outcome_str = " ❌"
+        outcome_str = " ✅ WIN" if outcome == "WIN" else (" ❌ LOSS" if outcome == "LOSS" else "")
         lines.append(
             f"{em} *{_esc(o['back_player_name'])}*{outcome_str}\n"
             f"  `{_esc(o.get('score_text',''))}` \\| edge `{o['edge_pp']:+.1f}pp`\n"

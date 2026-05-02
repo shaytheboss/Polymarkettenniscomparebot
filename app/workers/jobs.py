@@ -24,7 +24,7 @@ from app.models.alert import BotSettings
 from app.collectors.tennis_live import fetch_all_today, fetch_upcoming_matches
 from app.collectors.elo_collector import refresh_elo, find_player_by_name
 from app.utils.name_matcher import _last_name
-from app.collectors.polymarket import fetch_match_price, batch_fetch_prices, fetch_last_trade_price
+from app.collectors.polymarket import fetch_match_price, batch_fetch_prices, fetch_best_ask
 from app.analyzers.opportunity_detector import process_live_match
 from app.bot.telegram_bot import send_opportunity_alert
 from app.models.opportunity import Opportunity
@@ -42,7 +42,7 @@ _DEFAULTS = {
     "analyzer_sec":       settings.analyzer_interval,
 }
 
-_heartbeat_count = 0  # incremented each call; Telegram update every 6th (≈30 min)
+_heartbeat_count = 0  # incremented each call; Telegram update every 48th (≈4 hours)
 
 # Tracks edge_pp at the time of the last alert for each (match_id, back_player).
 # Used to suppress re-alerts when the edge hasn't changed materially.
@@ -92,23 +92,23 @@ async def job_heartbeat():
         f"dedup={_DEFAULTS['alert_dedup_min']}min"
     )
 
-    # Send Telegram status update every 6th heartbeat (≈30 minutes)
-    if _heartbeat_count % 6 == 0:
+    # Send Telegram status update every 48th heartbeat (≈4 hours)
+    if _heartbeat_count % 48 == 0:
         try:
             from app.bot.telegram_bot import broadcast_message
             ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
             live_icon = "🟢" if live_n > 0 else "⚪"
             msg = (
-                f"📡 סטטוס בוט [{ts}]\n"
-                f"{live_icon} משחקים חיים: {live_n}\n"
-                f"📊 הזדמנויות היום: {opps_n}\n"
-                f"👥 שחקנים: ATP {atp_players} | WTA {wta_players}\n"
-                f"⚙️ ספים: edge≥{_DEFAULTS['min_edge_pp']}pp | gap≤{_DEFAULTS['max_model_gap_pp']}pp\n"
+                f"Bot status [{ts}]\n"
+                f"{live_icon} Live matches: {live_n}\n"
+                f"Opportunities today: {opps_n}\n"
+                f"Players: ATP {atp_players} | WTA {wta_players}\n"
+                f"Thresholds: edge>={_DEFAULTS['min_edge_pp']}pp | gap<={_DEFAULTS['max_model_gap_pp']}pp\n"
                 f"\n"
-                f"📐 מה המודלים אומרים:\n"
-                f"  TABLE — טבלאות ניצחון מ-50K משחקים היסטוריים. מדויק למצבי משחק מוכרים (1-0 סטים, 5-4 גיים וכד').\n"
-                f"  MARKOV — סימולציית נקודה-אחר-נקודה לפי ELO השחקנים. מגיב למצב הנוכחי בדיוק גבוה יותר.\n"
-                f"  Consensus — ממוצע משוקלל (45% TABLE + 55% MARKOV). זה מה שמשווים לפוליס."
+                f"Models:\n"
+                f"  TABLE  — win-rate tables from 50K historical matches\n"
+                f"  MARKOV — point-by-point simulation using player ELO\n"
+                f"  Consensus — weighted average (45% TABLE + 55% MARKOV)"
             )
             asyncio.ensure_future(broadcast_message(msg))
         except Exception as e:
@@ -178,13 +178,13 @@ async def _job_fetch_live_scores_inner():
                 new_count += 1
                 if raw["status"] == "live":
                     live_notifications.append(
-                        _build_live_notification("🟢 משחק חדש התחיל!", raw, match)
+                        _build_live_notification("🟢 Match started!", raw, match)
                     )
             else:
                 # Detect transition to live
                 if match.status != "live" and raw["status"] == "live":
                     live_notifications.append(
-                        _build_live_notification("🔴 משחק התחיל!", raw, match)
+                        _build_live_notification("🔴 Match started!", raw, match)
                     )
                 # Detect set completion during live match
                 elif match.status == "live" and raw["status"] == "live":
@@ -192,7 +192,7 @@ async def _job_fetch_live_scores_inner():
                     new_sets = raw["p1_sets"] + raw["p2_sets"]
                     if new_sets > old_sets:
                         set_won_notifications.append(
-                            _build_live_notification("🎾 סט הסתיים!", raw, match)
+                            _build_live_notification("🎾 Set completed!", raw, match)
                         )
                 updated_count += 1
 
@@ -237,28 +237,33 @@ def _build_live_notification(header: str, raw: dict, match) -> str:
     """Build a Telegram message for a match going live or a set completing."""
     p1 = raw["player1_name"]
     p2 = raw["player2_name"]
-    score = raw.get("score_text") or "—"
+    score = raw.get("score_text") or "-"
     surface_emoji = {"hard": "🔵", "clay": "🟤", "grass": "🟢"}.get(raw["surface"], "⚫")
     p1_elo = match.p1_elo_at_match or 1500
     p2_elo = match.p2_elo_at_match or 1500
 
-    poly_line = ""
+    # Flag when ELO is missing (default stub value)
+    p1_elo_str = f"{p1_elo:.0f}" if abs(p1_elo - 1500) > 1 else "1500 (no data)"
+    p2_elo_str = f"{p2_elo:.0f}" if abs(p2_elo - 1500) > 1 else "1500 (no data)"
+
     if match.last_poly_price_p1 is not None:
         pr = match.last_poly_price_p1
         poly_line = (
-            f"\n💰 Polymarket: {p1.split()[-1]} {pr*100:.0f}% | "
+            f"\nPolymarket (ask): {p1.split()[-1]} {pr*100:.0f}% | "
             f"{p2.split()[-1]} {(1-pr)*100:.0f}%"
         )
+    else:
+        poly_line = "\nPolymarket: searching..."
 
     return (
         f"{header}\n"
         f"🎾 {p1} vs {p2}\n"
         f"{surface_emoji} {raw['tour']} | {raw['surface'].capitalize()}"
-        f" | {raw.get('tournament','')}\n"
-        f"📊 Score: {score}\n"
-        f"ELO: {p1.split()[-1]} {p1_elo:.0f} vs {p2.split()[-1]} {p2_elo:.0f}"
+        f" | {raw.get('tournament', '')}\n"
+        f"Score: {score}\n"
+        f"ELO: {p1.split()[-1]} {p1_elo_str} vs {p2.split()[-1]} {p2_elo_str}"
         f"{poly_line}\n"
-        f"🔗 {_market_url(match, p1, p2)}"
+        f"{_market_url(match, p1, p2)}"
     )
 
 
@@ -342,15 +347,15 @@ async def job_fetch_polymarket():
                 )
 
                 if price is not None:
-                    # Prefer last trade price over mid price when token ID is known
+                    # Use best ask (actual buying price) over mid when token ID is known
                     effective_price = price
                     last_trade = None
                     if token_id:
-                        last_trade = await fetch_last_trade_price(token_id)
+                        last_trade = await fetch_best_ask(token_id)
                         if last_trade is not None:
                             effective_price = last_trade
                             logger.debug(
-                                f"Last trade price for {p1_name}: {last_trade:.3f} "
+                                f"Best ask for {p1_name}: {last_trade:.3f} "
                                 f"(mid was {price:.3f})"
                             )
                     match.last_poly_price_p1 = effective_price
@@ -374,16 +379,16 @@ async def job_fetch_polymarket():
                     p1_elo = match.p1_elo_at_match or 1500
                     p2_elo = match.p2_elo_at_match or 1500
                     display_price = effective_price if last_trade else price
-                    price_label = "עסקה אחרונה" if last_trade else "mid"
+                    price_label = "ask" if last_trade else "mid"
                     msg = (
-                        f"💹 Polymarket נמצא!\n"
+                        f"Polymarket linked!\n"
                         f"🎾 {p1_name} vs {p2_name}\n"
-                        f"💰 {p1_name.split()[-1]}: {display_price*100:.1f}% | "
+                        f"{p1_name.split()[-1]}: {display_price*100:.1f}% | "
                         f"{p2_name.split()[-1]}: {(1-display_price)*100:.1f}%"
-                        f"  _({price_label})_\n"
+                        f"  ({price_label})\n"
                         f"ELO: {p1_elo:.0f} vs {p2_elo:.0f}\n"
-                        f"Score: {match.score_text or '—'}\n"
-                        f"🔗 {direct_url}"
+                        f"Score: {match.score_text or '-'}\n"
+                        f"{direct_url}"
                     )
                     asyncio.ensure_future(broadcast_message(msg))
 
@@ -572,22 +577,22 @@ async def _send_match_summary(
     losses = sum(1 for outcome, *_ in opp_rows if outcome == "LOSS")
 
     lines = [
-        f"🏁 משחק הסתיים",
+        f"Match finished",
         f"🎾 {p1_name} vs {p2_name}",
-        f"🏆 ניצח: {winner_name}  |  {score_text}",
+        f"Winner: {winner_name}  |  {score_text}",
         f"",
-        f"📊 הזדמנויות שזיהינו ({len(opp_rows)}):",
+        f"Opportunities detected ({len(opp_rows)}):",
     ]
     for outcome, back_name, cons_prob, poly_price, edge_pp, score in opp_rows:
-        icon = "✅ WIN" if outcome == "WIN" else "❌ LOSS"
-        lines.append(f"  {icon}  הימרנו: {back_name}")
+        icon = "WIN" if outcome == "WIN" else "LOSS"
+        lines.append(f"  {icon}  Backed: {back_name}")
         lines.append(
-            f"       Cons {cons_prob*100:.0f}% vs Poly {poly_price*100:.0f}%"
+            f"       Consensus {cons_prob*100:.0f}% vs Poly {poly_price*100:.0f}%"
             f"  |  Edge {edge_pp:+.1f}pp"
         )
         if score:
-            lines.append(f"       בניקוד: {score}")
-    lines += [f"", f"📈 סה\"כ: {wins}✅  {losses}❌"]
+            lines.append(f"       At score: {score}")
+    lines += [f"", f"Total: {wins} WIN  {losses} LOSS"]
 
     asyncio.ensure_future(broadcast_message("\n".join(lines)))
 
