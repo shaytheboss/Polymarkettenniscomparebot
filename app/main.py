@@ -76,19 +76,19 @@ async def lifespan(app: FastAPI):
         try:
             from app.bot.telegram_bot import broadcast_message
             await broadcast_message(
-                f"🚀 Tennis Arb Bot עלה לאוויר ורץ ברקע!\n"
+                f"🚀 Tennis Arb Bot is live!\n"
                 f"\n"
-                f"⚙️ סריקה אוטומטית פעילה — אין צורך להפעיל כלום:\n"
-                f"  • משחקים: כל {settings.live_scores_interval}שנ'\n"
-                f"  • Polymarket: כל {settings.polymarket_interval}שנ'\n"
-                f"  • אנליזה: כל {settings.analyzer_interval}שנ'\n"
+                f"Automatic scanning active — no manual action needed:\n"
+                f"  - Live scores: every {settings.live_scores_interval}s\n"
+                f"  - Polymarket: every {settings.polymarket_interval}s\n"
+                f"  - Analysis: every {settings.analyzer_interval}s\n"
                 f"\n"
-                f"ספי ברירת מחדל:\n"
-                f"  edge ≥ {settings.default_min_edge_pp}pp\n"
-                f"  model gap ≤ {settings.default_max_model_gap_pp}pp\n"
+                f"Default thresholds:\n"
+                f"  edge >= {settings.default_min_edge_pp}pp\n"
+                f"  model gap <= {settings.default_max_model_gap_pp}pp\n"
                 f"  dedup {settings.alert_dedup_minutes}min\n"
                 f"\n"
-                f"📡 עדכון סטטוס יישלח כל 30 דקות."
+                f"Status update sent every 4 hours."
             )
         except Exception as exc:
             logger.error(f"Startup broadcast failed: {exc}")
