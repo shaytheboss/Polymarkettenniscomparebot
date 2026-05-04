@@ -88,6 +88,7 @@ async def send_opportunity_alert(opportunity, match, db) -> None:
         p1_games=opportunity.p1_games or 0,
         p2_games=opportunity.p2_games or 0,
         polymarket_url=poly_url,
+        last_trade_price=float(opportunity.poly_price),  # stored price is already best ask
     )
 
     from app.models.alert import BotSettings as _BotSettings
