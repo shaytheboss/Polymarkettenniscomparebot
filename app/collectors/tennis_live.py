@@ -577,6 +577,15 @@ async def fetch_live_matches() -> list[dict]:
         _fetch_espn(f"{_ESPN_WTA_BASE}?dates={today}", "WTA"),
     )
     all_matches = atp + wta
+    seen_pairs: set[tuple[str, str]] = set()
+    deduped: list[dict] = []
+    for m in all_matches:
+        n1 = m["player1_name"].lower().strip()
+        n2 = m["player2_name"].lower().strip()
+        if (n1, n2) not in seen_pairs and (n2, n1) not in seen_pairs:
+            seen_pairs.add((n1, n2))
+            deduped.append(m)
+    all_matches = deduped
     live = [m for m in all_matches if m["status"] == "live"]
     logger.info(f"ESPN fallback live: {len(live)}/{len(all_matches)}")
     return live
@@ -605,6 +614,23 @@ async def fetch_all_today() -> list[dict]:
         _fetch_espn(f"{_ESPN_WTA_BASE}?dates={today_espn}", "WTA"),
     )
     espn_matches = atp + wta
+    # Deduplicate: same match can appear in both ATP and WTA feeds when ESPN
+    # miscategorises a player.  Keep the first occurrence (WTA feed wins because
+    # it appears last and we reverse; actually keep first = ATP, but player name
+    # canonicalisation catches tour mismatches later).
+    seen_pairs: set[tuple[str, str]] = set()
+    deduped: list[dict] = []
+    for m in espn_matches:
+        n1 = m["player1_name"].lower().strip()
+        n2 = m["player2_name"].lower().strip()
+        if (n1, n2) not in seen_pairs and (n2, n1) not in seen_pairs:
+            seen_pairs.add((n1, n2))
+            deduped.append(m)
+        else:
+            logger.debug(f"ESPN dedup: dropped duplicate '{m['player1_name']} vs {m['player2_name']}' ({m['tour']})")
+    if len(deduped) < len(espn_matches):
+        logger.info(f"ESPN dedup: removed {len(espn_matches) - len(deduped)} duplicate(s)")
+    espn_matches = deduped
     if espn_matches:
         logger.info(f"[Source: ESPN] {len(espn_matches)} total matches today")
         return espn_matches

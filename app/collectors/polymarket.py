@@ -109,22 +109,56 @@ async def fetch_clob_prices(token_ids: list[str]) -> tuple[dict[str, float], boo
     unique_ids = list(dict.fromkeys(token_ids))  # deduplicate, preserve order
     try:
         async with _client() as c:
-            resp = await c.get(
-                _clob_url("/prices"),
-                params={"token_id": ",".join(unique_ids)},
-            )
+            # CLOB V2 requires repeated token_id params.
+            # params={"token_id": "a,b"} sends ?token_id=a%2Cb (URL-encoded comma) — rejected.
+            # params=[("token_id", id) ...] sends ?token_id=a&token_id=b — correct.
+            params = [("token_id", tid) for tid in unique_ids]
+            resp = await c.get(_clob_url("/prices"), params=params)
             resp.raise_for_status()
             data = resp.json()
         # Response: {"token_id_1": "0.65", "token_id_2": "0.35"}
         return {k: float(v) for k, v in data.items() if v is not None}, True
     except httpx.HTTPStatusError as e:
-        _cache["last_error"] = f"CLOB HTTP {e.response.status_code}: {e.response.text[:60]}"
-        logger.warning(f"CLOB /prices HTTP {e.response.status_code}")
+        body = e.response.text[:80]
+        _cache["last_error"] = f"CLOB HTTP {e.response.status_code}: {body}"
+        logger.warning(f"CLOB /prices HTTP {e.response.status_code}: {body}")
+        # Batch endpoint rejected — fall back to individual /price calls per token
+        if e.response.status_code in (400, 422):
+            logger.info("CLOB /prices batch rejected — trying individual /price calls")
+            return await _fetch_clob_prices_individual(unique_ids)
         return {}, False
     except Exception as e:
         _cache["last_error"] = f"CLOB {type(e).__name__}: {e}"
         logger.warning(f"CLOB /prices error: {type(e).__name__}: {e}")
         return {}, False
+
+
+async def _fetch_clob_prices_individual(
+    token_ids: list[str],
+) -> tuple[dict[str, float], bool]:
+    """Fetch prices one at a time via GET /price (singular) when batch /prices fails."""
+    import asyncio as _asyncio
+
+    async def _one(tid: str) -> tuple[str, Optional[float]]:
+        try:
+            async with _client() as c:
+                resp = await c.get(_clob_url("/price"), params={"token_id": tid})
+                resp.raise_for_status()
+                data = resp.json()
+            raw = data.get("price") if isinstance(data, dict) else None
+            if raw is not None:
+                return tid, float(raw)
+        except Exception as exc:
+            logger.debug(f"CLOB /price individual failed for {tid[:16]}: {exc}")
+        return tid, None
+
+    results = await _asyncio.gather(*[_one(tid) for tid in token_ids])
+    prices = {tid: p for tid, p in results if p is not None}
+    if prices:
+        logger.info(f"CLOB individual /price: {len(prices)}/{len(token_ids)} prices retrieved")
+        _cache["last_error"] = ""  # clear the batch error now that individual worked
+    ok = bool(prices) or not token_ids
+    return prices, ok
 
 
 async def fetch_last_trade_price(token_id: str) -> Optional[float]:
@@ -626,7 +660,7 @@ async def test_connectivity() -> dict:
     except Exception as e:
         result["http_status"] = f"{type(e).__name__}: {e}"
 
-    # Test CLOB API (separate check — often blocked by Cloudflare on cloud IPs)
+    # Test CLOB API reachability via /markets (unauthenticated, low-cost check)
     try:
         async with _client(timeout=10.0) as c:
             resp = await c.get(_clob_url("/markets"), params={"limit": 1})
@@ -635,5 +669,45 @@ async def test_connectivity() -> dict:
     except Exception as e:
         result["clob_status"] = f"{type(e).__name__}: {str(e)[:60]}"
         result["clob_ok"] = False
+
+    # Test CLOB price fetch using a token from the markets we just fetched.
+    # This validates /price responds properly (endpoint live + format accepted).
+    if result["clob_ok"] and result.get("ok"):
+        try:
+            # Find the first market with a clobTokenId from the Gamma results
+            test_token: Optional[str] = None
+            async with _client(timeout=12.0) as c:
+                resp2 = await c.get(
+                    _gamma_url("/events"),
+                    params={"tag_id": 864, "active": "true", "closed": "false", "limit": 3},
+                )
+                if resp2.status_code == 200:
+                    events2 = resp2.json()
+                    if isinstance(events2, dict):
+                        events2 = events2.get("data", [])
+                    for ev2 in events2:
+                        for mkt in ev2.get("markets", []):
+                            tokens = _extract_token_ids(mkt)
+                            if tokens:
+                                test_token = tokens[0]
+                                break
+                        if test_token:
+                            break
+
+            if test_token:
+                async with _client(timeout=10.0) as c:
+                    resp3 = await c.get(
+                        _clob_url("/prices"),
+                        params=[("token_id", test_token)],
+                    )
+                    result["clob_price_status"] = resp3.status_code
+                    result["clob_price_ok"] = resp3.status_code == 200
+                    if resp3.status_code != 200:
+                        result["clob_price_error"] = resp3.text[:80]
+            else:
+                result["clob_price_ok"] = None  # no token available to test
+        except Exception as e:
+            result["clob_price_status"] = f"{type(e).__name__}: {str(e)[:40]}"
+            result["clob_price_ok"] = False
 
     return result
