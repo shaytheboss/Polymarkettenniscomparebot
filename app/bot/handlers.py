@@ -392,21 +392,30 @@ async def cmd_polytest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     endpoint_line = f"Endpoint: {diag.get('endpoint', '?')}"
 
+    clob_ok = diag.get("clob_ok", False)
+    clob_status = diag.get("clob_status", "?")
+    clob_line = f"CLOB (real-time prices): {'OK' if clob_ok else f'BLOCKED ({clob_status})'}"
+
     if diag["ok"]:
-        status_line = f"API available — {diag['markets_found']} tennis markets"
+        status_line = f"Gamma API: OK — {diag['markets_found']} tennis markets"
         sample_line = f"Sample: \"{diag['sample_question']}\"" if diag["sample_question"] else ""
     else:
-        status_line = f"API blocked — HTTP {diag['http_status']}"
+        status_line = f"Gamma API: BLOCKED — HTTP {diag['http_status']}"
         sample_line = (
-            "\nFree fix (Cloudflare Worker):\n"
+            "\nFix — deploy Cloudflare Worker relay:\n"
             "1. cloudflare.com -> Workers -> Create Worker\n"
             "2. Paste cloudflare-worker.js from the repo\n"
             "3. Save & Deploy -> copy the worker URL\n"
-            "4. Railway Variables: POLYMARKET_RELAY_URL=<url>\n"
-            "\nAlternative: /setpoly <player> <condition_id>"
+            "4. Railway Variables: POLYMARKET_RELAY_URL=<url>"
         )
 
-    lines = [route_line, endpoint_line, status_line]
+    if not clob_ok and diag["ok"]:
+        sample_line += (
+            "\n\nGamma works but CLOB is blocked.\n"
+            "Prices update from Gamma (~1 min lag) — set relay for real-time CLOB prices."
+        )
+
+    lines = [route_line, endpoint_line, status_line, clob_line]
     if sample_line:
         lines.append(sample_line)
 

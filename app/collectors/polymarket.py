@@ -178,9 +178,10 @@ async def fetch_best_ask(token_id: str) -> Optional[float]:
     """
     Fetch the best ask price for a token — the actual price you'd pay to buy YES.
 
-    Attempts in order:
-      1. GET /book  — reads asks[0].price (lowest offer in the order book)
-      2. GET /last-trade-price — last executed trade as fallback
+    Returns None when:
+    - The order book is empty (no active sellers)
+    - The price is extreme (< 0.04 or > 0.96) — likely a stale/resolved market
+    Does NOT fall back to last-trade-price to avoid stale data from finished matches.
     """
     try:
         async with _client() as c:
@@ -192,26 +193,16 @@ async def fetch_best_ask(token_id: str) -> Optional[float]:
             book = resp.json()
         asks = book.get("asks", [])
         if asks:
-            return float(asks[0]["price"])
-        # Book empty — fall through to last-trade fallback
+            # Use min() — defensive against APIs that return asks in descending order
+            best = min(float(a["price"]) for a in asks)
+            if 0.04 <= best <= 0.96:
+                return best
+            logger.warning(
+                f"fetch_best_ask: extreme ask {best:.3f} for {token_id[:16]} — "
+                f"market likely resolved or stale, discarding"
+            )
     except Exception as e:
         logger.debug(f"CLOB /book failed for {token_id[:12]}: {e}")
-
-    # Fallback: last executed trade price
-    try:
-        async with _client() as c:
-            resp = await c.get(
-                _clob_url("/last-trade-price"),
-                params={"token_id": token_id},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        price = data.get("price")
-        if price is not None:
-            return float(price)
-    except Exception as e:
-        logger.debug(f"CLOB /last-trade-price failed for {token_id[:12]}: {e}")
-
     return None
 
 
@@ -451,8 +442,16 @@ def _find_player1_idx(market: dict, player1: str, player2: str = "") -> int:
 # Direct condition-ID price lookup (Gamma API)
 # ---------------------------------------------------------------------------
 
-async def fetch_price_by_condition_id(condition_id: str) -> Optional[float]:
-    """Fetch P(player1 wins) from Gamma API for a known condition ID."""
+async def fetch_price_by_condition_id(
+    condition_id: str,
+    player1: str = "",
+    player2: str = "",
+) -> Optional[float]:
+    """Fetch P(player1 wins) from Gamma API for a known condition ID.
+
+    Player names are used to identify the correct outcome index (0 or 1).
+    Without them we default to index 0 which may return the wrong player's price.
+    """
     try:
         async with _client() as c:
             resp = await c.get(
@@ -462,9 +461,17 @@ async def fetch_price_by_condition_id(condition_id: str) -> Optional[float]:
             resp.raise_for_status()
             data = resp.json()
         market = data[0] if isinstance(data, list) and data else (data or {})
-        return _extract_gamma_price(market, player_idx=0)
+        player_idx = _find_player1_idx(market, player1, player2) if player1 else 0
+        price = _extract_gamma_price(market, player_idx=player_idx)
+        if price is not None:
+            logger.info(
+                f"Gamma price (cid={condition_id[:12]}): "
+                f"{player1.split()[-1] if player1 else 'P1'}={price*100:.1f}% "
+                f"(idx={player_idx})"
+            )
+        return price
     except Exception as e:
-        logger.debug(f"Gamma condition lookup {condition_id[:12]}...: {e}")
+        logger.warning(f"Gamma condition lookup {condition_id[:12]}: {e}")
         return None
 
 
@@ -498,9 +505,9 @@ async def fetch_match_price(
         if token_id in prices:
             return prices[token_id], condition_id, None, token_id
 
-    # Strategy 2: Gamma API direct condition lookup
+    # Strategy 2: Gamma API direct condition lookup (with correct player index)
     if condition_id:
-        price = await fetch_price_by_condition_id(condition_id)
+        price = await fetch_price_by_condition_id(condition_id, player1, player2)
         return price, condition_id, None, token_id
 
     # Strategy 3: Auto-discover via cached market search
@@ -598,6 +605,7 @@ async def test_connectivity() -> dict:
         "endpoint": _gamma_url("/events"),
     }
 
+    # Test Gamma API
     try:
         async with _client(timeout=15.0) as c:
             resp = await c.get(
@@ -608,7 +616,6 @@ async def test_connectivity() -> dict:
             if resp.status_code == 200:
                 data = resp.json()
                 events = data if isinstance(data, list) else data.get("data", [])
-                # Count individual markets across all events
                 all_markets = [m for e in events for m in e.get("markets", [])]
                 result["ok"] = True
                 result["markets_found"] = len(all_markets)
@@ -618,5 +625,15 @@ async def test_connectivity() -> dict:
                     result["sample_question"] = q[:80]
     except Exception as e:
         result["http_status"] = f"{type(e).__name__}: {e}"
+
+    # Test CLOB API (separate check — often blocked by Cloudflare on cloud IPs)
+    try:
+        async with _client(timeout=10.0) as c:
+            resp = await c.get(_clob_url("/markets"), params={"limit": 1})
+            result["clob_status"] = resp.status_code
+            result["clob_ok"] = resp.status_code == 200
+    except Exception as e:
+        result["clob_status"] = f"{type(e).__name__}: {str(e)[:60]}"
+        result["clob_ok"] = False
 
     return result

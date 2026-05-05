@@ -327,39 +327,74 @@ async def job_fetch_polymarket():
                         m.polymarket_condition_id = None
                         m.polymarket_slug = None
 
-        # Phase 2: discover / update matches not covered by batch
+        # Was the CLOB batch call actually useful (connected + returned at least one price)?
+        clob_up = batch_ok and bool(batch_prices)
+        if token_map and not clob_up:
+            logger.warning(
+                f"CLOB batch failed or returned no prices "
+                f"(batch_ok={batch_ok}, n_tokens={len(token_map)}) — "
+                f"falling back to Gamma API for price updates"
+            )
+
+        # Phase 2: discover / update matches not covered by CLOB batch
         for match in matches:
             try:
                 if not match.player1 or not match.player2:
                     continue
-                # Skip only if batch successfully updated this specific match
+                # Skip if CLOB already gave us a fresh price this cycle
                 if match.external_id in batch_prices:
                     continue
 
                 p1_name = match.player1.name
                 p2_name = match.player2.name
 
-                price, cid, slug, token_id = await fetch_match_price(
-                    player1=p1_name,
-                    player2=p2_name,
-                    condition_id=match.polymarket_condition_id,
-                    token_id=getattr(match, "polymarket_token_id", None),
-                )
+                # When CLOB is down AND this match is already linked, go straight to
+                # Gamma — avoids wasting a redundant failing CLOB call first.
+                if not clob_up and match.polymarket_condition_id:
+                    from app.collectors.polymarket import fetch_price_by_condition_id
+                    price = await fetch_price_by_condition_id(
+                        match.polymarket_condition_id, p1_name, p2_name
+                    )
+                    cid = match.polymarket_condition_id
+                    slug = getattr(match, "polymarket_slug", None)
+                    token_id = getattr(match, "polymarket_token_id", None)
+                else:
+                    price, cid, slug, token_id = await fetch_match_price(
+                        player1=p1_name,
+                        player2=p2_name,
+                        condition_id=match.polymarket_condition_id,
+                        token_id=getattr(match, "polymarket_token_id", None),
+                    )
 
                 if price is not None:
-                    # Use best ask (actual buying price) over mid when token ID is known
+                    # Use best ask (actual buying price) when token ID is known.
+                    # Cross-validate: only accept ask if it's within 12pp of the CLOB mid.
                     effective_price = price
                     last_trade = None
-                    if token_id:
+                    if token_id and clob_up:
                         last_trade = await fetch_best_ask(token_id)
                         if last_trade is not None:
-                            effective_price = last_trade
-                            logger.debug(
-                                f"Best ask for {p1_name}: {last_trade:.3f} "
-                                f"(mid was {price:.3f})"
-                            )
+                            if abs(last_trade - price) <= 0.12:
+                                effective_price = last_trade
+                            else:
+                                logger.warning(
+                                    f"Best ask {last_trade:.3f} diverges from mid {price:.3f} "
+                                    f"for {p1_name} — using mid"
+                                )
+                                last_trade = None
                     match.last_poly_price_p1 = effective_price
                     match.poly_updated_at = now
+                    logger.info(
+                        f"Poly price updated: {p1_name.split()[-1]}={effective_price*100:.1f}% "
+                        f"({'ask' if last_trade else 'mid/gamma'}) "
+                        f"vs {p2_name.split()[-1]}={(1-effective_price)*100:.1f}%"
+                    )
+                else:
+                    logger.warning(
+                        f"Poly price unavailable for {p1_name} vs {p2_name} "
+                        f"(cid={'set' if match.polymarket_condition_id else 'none'}, "
+                        f"token={'set' if getattr(match, 'polymarket_token_id', None) else 'none'})"
+                    )
 
                 newly_linked = cid and not match.polymarket_condition_id
                 if newly_linked:
