@@ -1,11 +1,26 @@
 """
-Daily ELO download from Tennis Abstract (Jeff Sackmann).
-Scrapes https://tennisabstract.com/reports/atp_elo_ratings.html (and WTA equivalent).
+Daily ELO download for the tennis bot.
 
-Player records store both the canonical Tennis Abstract name AND a normalized
-last-name index so we can fuzzy-match names from ESPN and Polymarket.
+Primary source: Tennis Abstract (Jeff Sackmann) HTML table.
+  ATP: https://tennisabstract.com/reports/atp_elo_ratings.html
+  WTA: https://tennisabstract.com/reports/wta_elo_ratings.html
+
+  Tennis Abstract blocks Railway/GCP/AWS cloud IPs (HTTP 403).
+  Fix: deploy cloudflare-worker.js and set POLYMARKET_RELAY_URL.
+  The worker routes /tennis-abstract/* → tennisabstract.com.
+
+Fallback: Jeff Sackmann's GitHub match CSVs (always accessible from Railway).
+  https://github.com/JeffSackmann/tennis_atp  (atp_matches_YEAR.csv)
+  https://github.com/JeffSackmann/tennis_wta  (wta_matches_YEAR.csv)
+
+  ELO is computed from last 3 available years using standard K=32 formula.
+  Surface ELO (hard/clay/grass) is updated per match surface.
+  Compared to Tennis Abstract: relative rankings are accurate, absolute
+  values differ slightly because we start from a 3-year window (not 50+).
 """
 from __future__ import annotations
+import csv
+import io
 import logging
 import re
 from datetime import date
@@ -21,8 +36,11 @@ from app.utils.name_matcher import _normalize, _last_name
 
 logger = logging.getLogger(__name__)
 
-ATP_ELO_URL = "https://tennisabstract.com/reports/atp_elo_ratings.html"
-WTA_ELO_URL = "https://tennisabstract.com/reports/wta_elo_ratings.html"
+ATP_ELO_PATH = "/reports/atp_elo_ratings.html"
+WTA_ELO_PATH = "/reports/wta_elo_ratings.html"
+
+GITHUB_BASE_ATP = "https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master"
+GITHUB_BASE_WTA = "https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master"
 
 _HEADERS = {
     "User-Agent": (
@@ -33,14 +51,44 @@ _HEADERS = {
 }
 
 
+def _ta_url(path: str) -> str:
+    """Build Tennis Abstract URL, routing through Polymarket relay if configured."""
+    from app.config import settings
+    relay = settings.polymarket_relay_url.rstrip("/")
+    if relay:
+        # Same Cloudflare Worker that proxies Polymarket — /tennis-abstract/* routes to TA
+        return f"{relay}/tennis-abstract{path}"
+    return f"https://tennisabstract.com{path}"
+
+
 def _clean_name(name: str) -> str:
     return name.strip().replace("\xa0", " ")
 
 
-async def _fetch_elo_page(url: str) -> list[dict]:
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        resp = await client.get(url, headers=_HEADERS)
-        resp.raise_for_status()
+# ---------------------------------------------------------------------------
+# Primary: Tennis Abstract HTML scraper
+# ---------------------------------------------------------------------------
+
+async def _fetch_elo_page(path: str) -> list[dict]:
+    """Scrape ELO table from Tennis Abstract. Returns [] if blocked or unavailable."""
+    url = _ta_url(path)
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            resp = await client.get(url, headers=_HEADERS)
+            if resp.status_code == 403:
+                logger.warning(
+                    f"Tennis Abstract blocked (HTTP 403) at {url} — "
+                    f"deploy cloudflare-worker.js and set POLYMARKET_RELAY_URL, "
+                    f"or use GitHub CSV fallback (automatic)"
+                )
+                return []
+            resp.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        logger.warning(f"Tennis Abstract HTTP {e.response.status_code} at {url}")
+        return []
+    except Exception as e:
+        logger.warning(f"Tennis Abstract unreachable: {e}")
+        return []
 
     soup = BeautifulSoup(resp.text, "lxml")
     table = soup.find("table", id="reportable") or soup.find("table")
@@ -52,22 +100,19 @@ async def _fetch_elo_page(url: str) -> list[dict]:
     if not rows_el:
         return []
 
-    # Normalize \xa0 (non-breaking space) → regular space before lower-casing
     headers = [
         th.get_text(strip=True).replace("\xa0", " ").lower()
         for th in rows_el[0].find_all(["th", "td"])
     ]
-    logger.info(f"ELO table headers at {url}: {headers}")
+    logger.info(f"ELO table headers: {headers}")
 
-    def col_idx_exact(candidates: list[str]) -> Optional[int]:
-        """Match a column whose header is EXACTLY one of the candidates."""
+    def col_exact(candidates: list[str]) -> Optional[int]:
         for i, h in enumerate(headers):
             if h in candidates:
                 return i
         return None
 
-    def col_idx_contains(candidates: list[str], excludes: list[str] = None) -> Optional[int]:
-        """Match first column whose header CONTAINS a candidate but not any exclude term."""
+    def col_contains(candidates: list[str], excludes: list[str] = None) -> Optional[int]:
         excl = excludes or []
         for cand in candidates:
             for i, h in enumerate(headers):
@@ -75,51 +120,24 @@ async def _fetch_elo_page(url: str) -> list[dict]:
                     return i
         return None
 
-    # Name column
-    name_idx = col_idx_exact(["player", "name"]) or col_idx_contains(["player", "name"])
-
-    # Overall ELO — must not be a surface-specific column.
-    # _surface_terms covers all separator variants Tennis Abstract has ever used.
+    name_idx = col_exact(["player", "name"]) or col_contains(["player", "name"])
     _surface_terms = ["hard", "clay", "grass", "carpet", "h.", "c.", "g.", "h-", "c-", "g-"]
     elo_idx = (
-        col_idx_exact(["elo", "overall elo", "overall"])
-        or col_idx_contains(["elo", "overall"], excludes=_surface_terms)
+        col_exact(["elo", "overall elo", "overall"])
+        or col_contains(["elo", "overall"], excludes=_surface_terms)
     )
-
-    # Surface ELOs — Tennis Abstract uses "H-Elo" / "C-Elo" / "G-Elo" (dash format).
-    # Also handle "H.Elo" (dot), bare "HElo", and plain English variants.
-    hard_idx = (
-        col_idx_exact(["h-elo", "helo", "h.elo", "hard elo", "hard"])
-        or col_idx_contains(["h-elo", "h.elo", "helo", "hardelo"])
-    )
-    clay_idx = (
-        col_idx_exact(["c-elo", "celo", "c.elo", "clay elo", "clay"])
-        or col_idx_contains(["c-elo", "c.elo", "celo", "clayelo"])
-    )
-    grass_idx = (
-        col_idx_exact(["g-elo", "gelo", "g.elo", "grass elo", "grass"])
-        or col_idx_contains(["g-elo", "g.elo", "gelo", "grasselo"])
-    )
-
-    # Ranking — prefer ATP/WTA rank column over ELO rank column
+    hard_idx = col_exact(["h-elo", "helo", "h.elo", "hard elo"]) or col_contains(["h-elo", "h.elo", "helo"])
+    clay_idx = col_exact(["c-elo", "celo", "c.elo", "clay elo"]) or col_contains(["c-elo", "c.elo", "celo"])
+    grass_idx = col_exact(["g-elo", "gelo", "g.elo", "grass elo"]) or col_contains(["g-elo", "g.elo", "gelo"])
     rank_idx = (
-        col_idx_exact(["atp rank", "wta rank", "atp", "wta"])
-        or col_idx_contains(["atp rank", "wta rank"])
-        or col_idx_exact(["rank", "#", "rk", "ranking"])
-        or col_idx_contains(["rank", "rk"], excludes=["elo"])
+        col_exact(["atp rank", "wta rank", "rank", "#", "rk", "ranking"])
+        or col_contains(["rank", "rk"], excludes=["elo"])
     )
 
     logger.info(
-        f"ELO column indices — name:{name_idx} elo:{elo_idx} "
-        f"hard:{hard_idx} clay:{clay_idx} grass:{grass_idx} rank:{rank_idx} "
-        f"(headers={headers})"
+        f"ELO columns — name:{name_idx} elo:{elo_idx} "
+        f"hard:{hard_idx} clay:{clay_idx} grass:{grass_idx} rank:{rank_idx}"
     )
-    if hard_idx is None or clay_idx is None or grass_idx is None:
-        logger.warning(
-            f"Surface ELO columns not found — hard:{hard_idx} clay:{clay_idx} grass:{grass_idx}. "
-            f"Players will use overall ELO as fallback. Raw headers: {headers}"
-        )
-
     if name_idx is None or elo_idx is None:
         logger.warning(f"Cannot identify ELO columns. Headers: {headers}")
         return []
@@ -150,7 +168,6 @@ async def _fetch_elo_page(url: str) -> list[dict]:
 
         name = _clean_name(cells[name_idx]) if name_idx < len(cells) else ""
         elo  = safe_float(elo_idx)
-        # Sanity check: realistic Elo range is 1200–2800
         if not name or not elo or not (1200 <= elo <= 2800):
             continue
 
@@ -166,15 +183,148 @@ async def _fetch_elo_page(url: str) -> list[dict]:
     return rows
 
 
-async def refresh_elo(tour: str, db: AsyncSession) -> int:
-    """Fetch and upsert ELO ratings. Returns count updated."""
-    url = ATP_ELO_URL if tour == "ATP" else WTA_ELO_URL
-    logger.info(f"Fetching {tour} ELO from {url}")
+# ---------------------------------------------------------------------------
+# Fallback: compute ELO from Jeff Sackmann's GitHub match CSVs
+# ---------------------------------------------------------------------------
 
+async def _compute_elo_from_github(tour: str) -> list[dict]:
+    """
+    Compute ELO from Jeff Sackmann's GitHub match data when Tennis Abstract is blocked.
+    Downloads the last 3 available years and computes surface ELO using K=32.
+    Returns same row format as _fetch_elo_page.
+    """
+    tour_lower = tour.lower()
+    base = GITHUB_BASE_ATP if tour == "ATP" else GITHUB_BASE_WTA
+    current_year = date.today().year
+
+    all_rows: list[dict] = []
+    years_loaded: list[str] = []
+
+    # Try last 4 years, accept whatever is available (usually last 3)
+    async with httpx.AsyncClient(timeout=40, headers=_HEADERS) as c:
+        for year in range(current_year, current_year - 4, -1):
+            url = f"{base}/{tour_lower}_matches_{year}.csv"
+            try:
+                resp = await c.get(url)
+                if resp.status_code == 200:
+                    reader = csv.DictReader(io.StringIO(resp.text))
+                    rows = list(reader)
+                    all_rows.extend(rows)
+                    years_loaded.append(str(year))
+                    logger.info(f"GitHub ELO: loaded {len(rows)} {tour} matches from {year}")
+                elif resp.status_code == 404:
+                    logger.debug(f"GitHub ELO: {tour} {year} not yet published")
+                else:
+                    logger.warning(f"GitHub ELO: {url} → HTTP {resp.status_code}")
+            except Exception as e:
+                logger.warning(f"GitHub ELO: failed to fetch {tour} {year}: {e}")
+
+    if not all_rows:
+        logger.error(f"GitHub ELO fallback: no {tour} match data available")
+        return []
+
+    logger.info(
+        f"GitHub ELO: computing from {len(all_rows)} {tour} matches "
+        f"({', '.join(years_loaded)})"
+    )
+
+    # Sort chronologically — tourney_date is YYYYMMDD string, sorts lexicographically
     try:
-        rows = await _fetch_elo_page(url)
-    except Exception as e:
-        logger.error(f"ELO fetch failed for {tour}: {e}")
+        all_rows.sort(key=lambda m: (m.get("tourney_date", "0"), m.get("match_num", "0")))
+    except Exception:
+        pass
+
+    player_elo: dict[str, float] = {}
+    surface_elo: dict[str, dict[str, float]] = {}
+    player_rank: dict[str, int] = {}
+    K = 32.0
+
+    def _elo(name: str) -> float:
+        return player_elo.get(name, 1500.0)
+
+    def _surf_elo(name: str, surf: str) -> float:
+        return surface_elo.get(name, {}).get(surf, 1500.0)
+
+    def _update_pair(winner: str, loser: str, surf: str) -> None:
+        ew, el = _elo(winner), _elo(loser)
+        exp_w = 1.0 / (1.0 + 10.0 ** ((el - ew) / 400.0))
+        player_elo[winner] = ew + K * (1.0 - exp_w)
+        player_elo[loser]  = el + K * (0.0 - (1.0 - exp_w))
+
+        if surf in ("hard", "clay", "grass"):
+            sw = _surf_elo(winner, surf)
+            sl = _surf_elo(loser, surf)
+            exp_sw = 1.0 / (1.0 + 10.0 ** ((sl - sw) / 400.0))
+            surface_elo.setdefault(winner, {})[surf] = sw + K * (1.0 - exp_sw)
+            surface_elo.setdefault(loser, {})[surf]  = sl + K * (0.0 - (1.0 - exp_sw))
+
+    for row in all_rows:
+        w_name = (row.get("winner_name") or "").strip()
+        l_name = (row.get("loser_name") or "").strip()
+        if not w_name or not l_name or w_name == l_name:
+            continue
+
+        surf_raw = (row.get("surface") or "Hard").lower()
+        surf = "clay" if surf_raw == "clay" else ("grass" if surf_raw == "grass" else "hard")
+
+        _update_pair(w_name, l_name, surf)
+
+        # Track most recent ranking for each player
+        try:
+            wr = int(row.get("winner_rank") or 0)
+            lr = int(row.get("loser_rank") or 0)
+            if wr > 0:
+                player_rank[w_name] = wr
+            if lr > 0:
+                player_rank[l_name] = lr
+        except (ValueError, TypeError):
+            pass
+
+    # Build output, sorted by overall ELO descending
+    result = []
+    for name, elo in sorted(player_elo.items(), key=lambda x: -x[1]):
+        if not (1200.0 <= elo <= 2800.0):
+            continue
+        surf = surface_elo.get(name, {})
+        result.append({
+            "name":      name,
+            "elo":       round(elo, 1),
+            "elo_hard":  round(surf.get("hard", elo), 1),
+            "elo_clay":  round(surf.get("clay", elo), 1),
+            "elo_grass": round(surf.get("grass", elo), 1),
+            "ranking":   player_rank.get(name),
+        })
+
+    logger.info(
+        f"GitHub ELO computed: {len(result)} {tour} players "
+        f"(data through end of {years_loaded[0] if years_loaded else '?'})"
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+async def refresh_elo(tour: str, db: AsyncSession) -> int:
+    """
+    Fetch and upsert ELO ratings. Returns count updated.
+
+    Try order:
+      1. Tennis Abstract HTML (direct, or via Cloudflare Worker relay if POLYMARKET_RELAY_URL set)
+      2. Jeff Sackmann's GitHub CSVs (always accessible — computed from last 3 years of matches)
+    """
+    path = ATP_ELO_PATH if tour == "ATP" else WTA_ELO_PATH
+    logger.info(f"Fetching {tour} ELO from {_ta_url(path)}")
+
+    rows = await _fetch_elo_page(path)
+
+    if not rows:
+        logger.info(f"Tennis Abstract unavailable — using GitHub CSV fallback for {tour} ELO")
+        rows = await _compute_elo_from_github(tour)
+
+    if not rows:
+        logger.error(f"All ELO sources failed for {tour}")
         return 0
 
     today = date.today()
@@ -185,8 +335,6 @@ async def refresh_elo(tour: str, db: AsyncSession) -> int:
         player = result.scalar_one_or_none()
 
         if player is None:
-            # Try fuzzy match to find ESPN-created stubs (which may use different name format).
-            # Threshold 0.85 catches accent/spacing differences without false positives.
             player = await find_player_by_name(row["name"], tour, db, fuzzy_threshold=0.85)
 
         if player is None:
@@ -194,7 +342,6 @@ async def refresh_elo(tour: str, db: AsyncSession) -> int:
             player.name_last = _last_name(row["name"])
             db.add(player)
         else:
-            # Ensure name_last is indexed (ESPN stubs created without it)
             if not player.name_last:
                 player.name_last = _last_name(player.name)
 
@@ -215,7 +362,7 @@ async def refresh_elo(tour: str, db: AsyncSession) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Name-aware ELO lookup (used by jobs.py)
+# Name-aware ELO lookup
 # ---------------------------------------------------------------------------
 
 async def find_player_by_name(
@@ -225,13 +372,13 @@ async def find_player_by_name(
     fuzzy_threshold: float = 0.80,
 ) -> Optional[Player]:
     """
-    Find a player in DB matching name, using a two-step approach:
-    1. DB query by normalized last name (fast, indexed)
-    2. Fuzzy match on the resulting candidates (precise)
+    Find a player in DB matching name.
+    Step 0: exact name + tour
+    Step 1: last-name DB filter, then fuzzy if multiple candidates
+    Step 2: full fuzzy scan (fallback — slower)
     """
     from app.utils.name_matcher import match_name
 
-    # Step 0: Exact match
     result = await db.execute(
         select(Player).where(Player.name == name, Player.tour == tour)
     )
@@ -239,19 +386,14 @@ async def find_player_by_name(
     if player:
         return player
 
-    # Step 1: Last-name DB filter (narrows to ~1-5 candidates)
     query_last = _last_name(name)
     result = await db.execute(
-        select(Player).where(
-            Player.tour == tour,
-            Player.name_last == query_last,
-        )
+        select(Player).where(Player.tour == tour, Player.name_last == query_last)
     )
     last_candidates = result.scalars().all()
     if last_candidates:
         if len(last_candidates) == 1:
             return last_candidates[0]
-        # Multiple players with same last name — fuzzy on full name
         names = [p.name for p in last_candidates]
         matched = match_name(name, names, threshold=fuzzy_threshold)
         if matched:
@@ -259,7 +401,6 @@ async def find_player_by_name(
                 if p.name == matched:
                     return p
 
-    # Step 2: Full fuzzy scan (fallback — slower but catches typos/accent diffs)
     result = await db.execute(select(Player).where(Player.tour == tour))
     all_players = result.scalars().all()
     if not all_players:
