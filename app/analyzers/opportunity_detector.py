@@ -68,9 +68,9 @@ async def process_live_match(
     responsible for rate-limiting re-alerts for updated_opportunities.
     """
     if match.status != "live":
-        return [], None
+        return [], [], None
     if not match.player1 or not match.player2:
-        return [], None
+        return [], [], None
 
     p1 = match.player1
     p2 = match.player2

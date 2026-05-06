@@ -44,10 +44,12 @@ _DEFAULTS = {
 
 _heartbeat_count = 0  # incremented each call; Telegram update every 48th (≈4 hours)
 
-# Tracks edge_pp at the time of the last alert for each (match_id, back_player).
-# Used to suppress re-alerts when the edge hasn't changed materially.
-_last_alert_edge: dict[tuple[int, int], float] = {}
-MATERIAL_EDGE_CHANGE_PP = 2.0
+# Opportunity IDs that have already been alerted — never re-alert the same opportunity.
+_alerted_opportunities: set[int] = set()
+
+# Decisive moment keys already sent per match: match_id → set of condition strings.
+# Prevents duplicate decisive-moment notifications within the same match.
+_notified_decisive: dict[int, set] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -138,8 +140,9 @@ async def _job_fetch_live_scores_inner():
     )
 
     new_count = updated_count = 0
-    live_notifications: list[str] = []   # new + transitioned-to-live matches
-    set_won_notifications: list[str] = []  # set completed during live match
+    live_notifications: list[str] = []    # new + transitioned-to-live matches
+    set_won_notifications: list[str] = [] # set completed during live match
+    decisive_notifications: list[str] = [] # decisive moment in set 2 or 3
 
     async with AsyncSessionLocal() as db:
         for raw in raw_matches:
@@ -196,6 +199,17 @@ async def _job_fetch_live_scores_inner():
                         )
                 updated_count += 1
 
+            # Decisive moment check for every live tick (new or ongoing match)
+            if raw["status"] == "live" and match.id is not None:
+                dm_key = _decisive_moment_key(raw)
+                if dm_key:
+                    already = _notified_decisive.setdefault(match.id, set())
+                    if dm_key not in already:
+                        decisive_notifications.append(
+                            _build_decisive_notification(raw, match, dm_key)
+                        )
+                        already.add(dm_key)
+
             match.status      = raw["status"]
             match.p1_sets     = raw["p1_sets"]
             match.p2_sets     = raw["p2_sets"]
@@ -211,7 +225,7 @@ async def _job_fetch_live_scores_inner():
     logger.info(f"DB upsert complete: {new_count} new, {updated_count} updated")
 
     from app.bot.telegram_bot import broadcast_message
-    for msg in live_notifications + set_won_notifications:
+    for msg in live_notifications + set_won_notifications + decisive_notifications:
         asyncio.ensure_future(broadcast_message(msg))
 
 
@@ -263,6 +277,86 @@ def _build_live_notification(header: str, raw: dict, match) -> str:
         f"Score: {score}\n"
         f"ELO: {p1.split()[-1]} {p1_elo_str} vs {p2.split()[-1]} {p2_elo_str}"
         f"{poly_line}\n"
+        f"{_market_url(match, p1, p2)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Decisive moment detection
+# ---------------------------------------------------------------------------
+
+def _decisive_moment_key(raw: dict) -> str | None:
+    """
+    Returns an opaque string key when a decisive-moment condition is true,
+    or None otherwise.  The key is stored so the same condition won't fire twice.
+
+    Conditions (per the defined notification rules):
+      Set 2 — set-1 winner leads by 2+ games OR has 5 games in current set.
+      Set 3 (decisive, 1-1) — either player leads by 2+ games (min 3) OR has 5 games.
+    """
+    p1_sets  = raw["p1_sets"]
+    p2_sets  = raw["p2_sets"]
+    p1_games = raw.get("p1_games") or 0
+    p2_games = raw.get("p2_games") or 0
+    total_sets = p1_sets + p2_sets
+
+    if total_sets == 1:
+        # Playing set 2; whoever has 1 set won set 1
+        if p1_sets == 1:
+            if p1_games >= 5:
+                return "set2_p1_matchpt"
+            if p1_games - p2_games >= 2 and p1_games >= 2:
+                return "set2_p1_leads2"
+        else:
+            if p2_games >= 5:
+                return "set2_p2_matchpt"
+            if p2_games - p1_games >= 2 and p2_games >= 2:
+                return "set2_p2_leads2"
+
+    elif total_sets == 2 and p1_sets == 1 and p2_sets == 1:
+        # Decisive set 3 — alert whoever is dominant
+        if p1_games >= 5:
+            return "set3_p1_matchpt"
+        if p2_games >= 5:
+            return "set3_p2_matchpt"
+        if p1_games - p2_games >= 2 and p1_games >= 3:
+            return "set3_p1_leads2"
+        if p2_games - p1_games >= 2 and p2_games >= 3:
+            return "set3_p2_leads2"
+
+    return None
+
+
+def _build_decisive_notification(raw: dict, match, dm_key: str) -> str:
+    p1    = raw["player1_name"]
+    p2    = raw["player2_name"]
+    score = raw.get("score_text") or "-"
+
+    p1_games = raw.get("p1_games") or 0
+    p2_games = raw.get("p2_games") or 0
+
+    if "p1" in dm_key:
+        lead_name = p1.split()[-1]
+        lead_g, trail_g = p1_games, p2_games
+    else:
+        lead_name = p2.split()[-1]
+        lead_g, trail_g = p2_games, p1_games
+
+    if "set3" in dm_key:
+        set_label = "decisive set 3"
+    else:
+        set_label = "set 2"
+
+    if "matchpt" in dm_key:
+        desc = f"{lead_name} is at {lead_g} games — one game from winning {set_label}"
+    else:
+        desc = f"{lead_name} leads {lead_g}-{trail_g} in {set_label}"
+
+    return (
+        f"⚡ Decisive moment!\n"
+        f"🎾 {p1} vs {p2}\n"
+        f"{desc}\n"
+        f"Score: {score}\n"
         f"{_market_url(match, p1, p2)}"
     )
 
@@ -460,36 +554,30 @@ async def job_run_analyzer():
                 new_opps, updated_opps, _calc = await process_live_match(match, db)
 
                 # Snapshot ids + edge values before commit (ORM objects expire after commit)
-                new_snap    = [(o.id, o.back_player, float(o.edge_pp)) for o in new_opps]
-                updated_snap = [(o.id, o.back_player, float(o.edge_pp)) for o in updated_opps]
+                new_snap = [(o.id, float(o.edge_pp), float(o.consensus_prob or 0))
+                            for o in new_opps]
                 await db.commit()
 
-                # New edge event — alert immediately (subject to per-user thresholds in send_opportunity_alert)
-                for opp_id, back_player, edge_pp in new_snap:
+                # Alert only for NEW opportunities that meet both thresholds:
+                # consensus > 70% AND edge >= 5pp.  Each opportunity is alerted at most once.
+                for opp_id, edge_pp, consensus in new_snap:
+                    if opp_id in _alerted_opportunities:
+                        continue
+                    if consensus < 0.70 or edge_pp < 5.0:
+                        logger.debug(
+                            f"Opportunity {opp_id} below alert threshold: "
+                            f"consensus={consensus:.0%} edge={edge_pp:.1f}pp"
+                        )
+                        continue
                     opp = (await db.execute(
                         select(Opportunity).where(Opportunity.id == opp_id)
                     )).scalar_one_or_none()
                     if opp:
                         try:
                             await send_opportunity_alert(opp, match, db)
+                            _alerted_opportunities.add(opp_id)
                         except Exception as e:
                             logger.error(f"Alert send failed: {e}")
-                        _last_alert_edge[(match.id, back_player)] = edge_pp
-
-                # Continuing edge event — only re-alert when edge moved materially
-                for opp_id, back_player, edge_pp in updated_snap:
-                    key = (match.id, back_player)
-                    last = _last_alert_edge.get(key, edge_pp)
-                    if abs(edge_pp - last) >= MATERIAL_EDGE_CHANGE_PP:
-                        opp = (await db.execute(
-                            select(Opportunity).where(Opportunity.id == opp_id)
-                        )).scalar_one_or_none()
-                        if opp:
-                            try:
-                                await send_opportunity_alert(opp, match, db)
-                            except Exception as e:
-                                logger.error(f"Re-alert send failed: {e}")
-                            _last_alert_edge[key] = edge_pp
 
             except Exception as e:
                 logger.error(f"Analyzer failed for match {match.id}: {e}", exc_info=True)
@@ -553,9 +641,8 @@ async def job_mark_finished():
 
     for args in just_finished:
         match_id = args[0]
-        # Clean up in-memory alert tracking so stale entries don't accumulate
-        for k in [k for k in _last_alert_edge if k[0] == match_id]:
-            del _last_alert_edge[k]
+        # Clean up in-memory decisive-moment tracking for finished match
+        _notified_decisive.pop(match_id, None)
         asyncio.ensure_future(_send_match_summary(*args))
 
 
@@ -606,13 +693,19 @@ async def _send_match_summary(
         await db.commit()
 
     if not opp_rows:
+        # No opportunities detected during this match — send a simple summary
+        asyncio.ensure_future(broadcast_message(
+            f"Match over!\n"
+            f"🎾 {p1_name} vs {p2_name}\n"
+            f"Winner: {winner_name}  |  {score_text}"
+        ))
         return
 
     wins   = sum(1 for outcome, *_ in opp_rows if outcome == "WIN")
     losses = sum(1 for outcome, *_ in opp_rows if outcome == "LOSS")
 
     lines = [
-        f"Match finished",
+        f"Match over!",
         f"🎾 {p1_name} vs {p2_name}",
         f"Winner: {winner_name}  |  {score_text}",
         f"",
