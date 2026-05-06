@@ -395,15 +395,20 @@ async def cmd_polytest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     clob_ok = diag.get("clob_ok", False)
     clob_status = diag.get("clob_status", "?")
     clob_price_ok = diag.get("clob_price_ok")
+    clob_fmt = diag.get("clob_price_format", "")
+    clob_val = diag.get("clob_price_value", "")
+    clob_tried = diag.get("clob_price_formats_tried", "")
+
     if not clob_ok:
         clob_line = f"CLOB: BLOCKED ({clob_status})"
     elif clob_price_ok is True:
-        clob_line = "CLOB: OK — live prices reachable"
+        clob_line = f"CLOB: OK — prices work via [{clob_fmt}]"
+        if clob_val:
+            clob_line += f" (test price: {clob_val})"
     elif clob_price_ok is False:
-        err = diag.get("clob_price_error", diag.get("clob_price_status", "?"))
-        clob_line = f"CLOB: reachable but /prices returned error ({err})"
+        clob_line = f"CLOB: reachable but all price formats failed\n  Tried: {clob_tried}"
     else:
-        clob_line = f"CLOB: reachable (no token to test prices)"
+        clob_line = "CLOB: reachable (no token to test prices)"
 
     if diag["ok"]:
         status_line = f"Gamma API: OK — {diag['markets_found']} tennis markets"
