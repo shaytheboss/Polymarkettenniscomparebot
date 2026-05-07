@@ -41,12 +41,24 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     username = update.effective_user.username or ""
     async with AsyncSessionLocal() as db:
         user = await _get_or_create_user(chat_id, username, db)
-        is_new = user.created_at and (datetime.now(timezone.utc) - user.created_at).total_seconds() < 5
+        try:
+            ts = user.created_at
+            if ts is not None and ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            is_new = ts is not None and (datetime.now(timezone.utc) - ts).total_seconds() < 10
+        except Exception:
+            is_new = False
     greeting = "Welcome to" if is_new else "Welcome back to"
-    await update.message.reply_text(
-        fmt_help().replace("*Tennis Arb Bot — Help*", f"*{greeting} Tennis Arb Bot\\!*"),
-        parse_mode="MarkdownV2",
-    )
+    try:
+        await update.message.reply_text(
+            fmt_help().replace("*Tennis Arb Bot — Help*", f"*{greeting} Tennis Arb Bot\\!*"),
+            parse_mode="MarkdownV2",
+        )
+    except Exception as e:
+        logger.error(f"cmd_start MarkdownV2 failed: {e}")
+        await update.message.reply_text(
+            f"{greeting} Tennis Arb Bot!\n\nCommands: /status /live /opps /settings /help"
+        )
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

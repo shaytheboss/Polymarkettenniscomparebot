@@ -451,9 +451,25 @@ async def job_fetch_polymarket():
                     price = await fetch_price_by_condition_id(
                         match.polymarket_condition_id, p1_name, p2_name
                     )
-                    cid = match.polymarket_condition_id
-                    slug = getattr(match, "polymarket_slug", None)
-                    token_id = getattr(match, "polymarket_token_id", None)
+                    if price is None:
+                        # fetch_price_by_condition_id returns None when the stored market
+                        # fails player validation (wrong market linked before the fix).
+                        # Clear it so search_tennis_markets can find the correct market.
+                        logger.warning(
+                            f"Wrong market stored for {p1_name} vs {p2_name} "
+                            f"(cid={str(match.polymarket_condition_id)[:12]}) — "
+                            f"clearing and re-discovering"
+                        )
+                        match.polymarket_condition_id = None
+                        match.polymarket_token_id = None
+                        match.polymarket_slug = None
+                        price, cid, slug, token_id = await fetch_match_price(
+                            player1=p1_name, player2=p2_name
+                        )
+                    else:
+                        cid = match.polymarket_condition_id
+                        slug = getattr(match, "polymarket_slug", None)
+                        token_id = getattr(match, "polymarket_token_id", None)
                 else:
                     price, cid, slug, token_id = await fetch_match_price(
                         player1=p1_name,

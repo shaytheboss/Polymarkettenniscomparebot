@@ -382,15 +382,26 @@ async def _fetch_tennis_events(limit: int = 100) -> list[dict]:
     for event in events:
         event_slug = event.get("slug", "")
         for item in event.get("markets", []):
-            # Attach event slug so fetch_match_price can build the correct URL
             item = dict(item)
             item["_event_slug"] = event_slug
-            # Populate homeTeam/awayTeam into question field if question is missing
             if not item.get("question") and (item.get("homeTeam") or item.get("awayTeam")):
                 item["question"] = f"{item.get('homeTeam', '')} vs {item.get('awayTeam', '')}"
-            markets.append(item)
+            # Only cache head-to-head match markets — skip tournament winner markets
+            # (e.g., "Will Draper win the Australian Open?") which have no opponent
+            if _is_match_market(item):
+                markets.append(item)
 
     return markets
+
+
+def _is_match_market(market: dict) -> bool:
+    """Return True only for head-to-head match markets, not tournament winner markets."""
+    home = (market.get("homeTeam") or "").strip()
+    away = (market.get("awayTeam") or "").strip()
+    if home and away:
+        return True
+    question = (market.get("question") or market.get("title") or "").lower()
+    return " vs " in question or " v." in question or " v " in question
 
 
 async def _refresh_cache() -> list[dict]:
@@ -597,6 +608,25 @@ async def fetch_price_by_condition_id(
             resp.raise_for_status()
             data = resp.json()
         market = data[0] if isinstance(data, list) and data else (data or {})
+
+        # Validate: both players must appear in this market.
+        # If only one (or neither) matches, the stored condition_id points to the wrong
+        # market — return None so the caller can clear it and re-discover.
+        if player1 and player2:
+            home = _normalize(market.get("homeTeam") or "")
+            away = _normalize(market.get("awayTeam") or "")
+            question = _normalize(market.get("question", "") or market.get("title", ""))
+            combined = f"{home} {away}" if (home and away) else question
+            s1 = _player_score(combined, player1)
+            s2 = _player_score(combined, player2)
+            if s1 == 0 or s2 == 0:
+                logger.warning(
+                    f"Stored condition_id {condition_id[:12]} doesn't match both players "
+                    f"({player1.split()[-1]} s={s1:.1f}, {player2.split()[-1]} s={s2:.1f}) "
+                    f"market='{(question or combined)[:60]}' — clearing for re-discovery"
+                )
+                return None
+
         player_idx = _find_player1_idx(market, player1, player2) if player1 else 0
         price = _extract_gamma_price(market, player_idx=player_idx)
         if price is not None:
