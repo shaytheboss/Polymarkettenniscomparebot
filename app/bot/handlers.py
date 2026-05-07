@@ -473,6 +473,68 @@ async def cmd_polytest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines))
 
 
+async def cmd_elostats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show ELO coverage stats and list players missing ELO data."""
+    async with AsyncSessionLocal() as db:
+        from sqlalchemy.orm import selectinload
+        atp_total = (await db.execute(
+            select(func.count()).select_from(Player).where(Player.tour == "ATP")
+        )).scalar() or 0
+        wta_total = (await db.execute(
+            select(func.count()).select_from(Player).where(Player.tour == "WTA")
+        )).scalar() or 0
+        atp_with_elo = (await db.execute(
+            select(func.count()).select_from(Player).where(
+                Player.tour == "ATP",
+                Player.current_elo.isnot(None),
+                Player.current_elo != 1500.0,
+            )
+        )).scalar() or 0
+        wta_with_elo = (await db.execute(
+            select(func.count()).select_from(Player).where(
+                Player.tour == "WTA",
+                Player.current_elo.isnot(None),
+                Player.current_elo != 1500.0,
+            )
+        )).scalar() or 0
+
+        # Find live players who are missing ELO
+        live_match_q = await db.execute(
+            select(Match)
+            .options(selectinload(Match.player1), selectinload(Match.player2))
+            .where(Match.status == "live")
+        )
+        live_matches = live_match_q.scalars().all()
+        missing: list[str] = []
+        for m in live_matches:
+            for p in (m.player1, m.player2):
+                if p is None:
+                    continue
+                if p.current_elo is None or abs(p.current_elo - 1500) <= 1:
+                    missing.append(f"{p.name} ({p.tour})")
+
+        elo_setting_q = await db.execute(
+            select(BotSettings).where(BotSettings.key == "last_elo_refresh")
+        )
+        elo_setting = elo_setting_q.scalar_one_or_none()
+
+    lines = [
+        "ELO coverage:",
+        f"  ATP: {atp_with_elo}/{atp_total} players ({atp_with_elo*100//max(atp_total,1)}%)",
+        f"  WTA: {wta_with_elo}/{wta_total} players ({wta_with_elo*100//max(wta_total,1)}%)",
+        f"  Last refresh: {elo_setting.value if elo_setting else 'never'}",
+    ]
+    if missing:
+        lines += ["", f"Live players without ELO ({len(missing)}):"]
+        lines += [f"  - {n}" for n in missing[:20]]
+        if len(missing) > 20:
+            lines.append(f"  ... and {len(missing) - 20} more")
+    else:
+        lines += ["", "All live players have ELO data ✓"]
+
+    await update.message.reply_text("\n".join(lines))
+
+
 async def cmd_setpoly(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Manually link a Polymarket market to a live match.

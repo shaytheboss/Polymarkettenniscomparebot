@@ -144,6 +144,8 @@ async def _job_fetch_live_scores_inner():
     set_won_notifications: list[str] = [] # set completed during live match
     decisive_notifications: list[str] = [] # decisive moment in set 2 or 3
 
+    from sqlalchemy.orm import selectinload
+
     async with AsyncSessionLocal() as db:
         for raw in raw_matches:
             p1_name = raw["player1_name"]
@@ -154,7 +156,11 @@ async def _job_fetch_live_scores_inner():
                 continue
 
             ext_id = raw["external_id"]
-            result = await db.execute(select(Match).where(Match.external_id == ext_id))
+            result = await db.execute(
+                select(Match)
+                .options(selectinload(Match.player1), selectinload(Match.player2))
+                .where(Match.external_id == ext_id)
+            )
             match = result.scalar_one_or_none()
 
             if match is None:
@@ -171,6 +177,9 @@ async def _job_fetch_live_scores_inner():
                     p1_elo_at_match=p1.surface_elo(raw["surface"]),
                     p2_elo_at_match=p2.surface_elo(raw["surface"]),
                 )
+                # Eager-load relationships so notifications can read player.current_elo
+                match.player1 = p1
+                match.player2 = p2
                 db.add(match)
                 await db.flush()
                 logger.info(
@@ -210,6 +219,18 @@ async def _job_fetch_live_scores_inner():
                         )
                         already.add(dm_key)
 
+            # Auto-heal ELO at match: if the stored value is the 1500 stub but the
+            # player now has real ELO data (a daily refresh ran after match creation),
+            # update the match's stored ELO so notifications and the analyzer see it.
+            if match.player1 and (not match.p1_elo_at_match or abs(match.p1_elo_at_match - 1500) <= 1):
+                live = match.player1.surface_elo(raw["surface"])
+                if live and abs(live - 1500) > 1:
+                    match.p1_elo_at_match = float(live)
+            if match.player2 and (not match.p2_elo_at_match or abs(match.p2_elo_at_match - 1500) <= 1):
+                live = match.player2.surface_elo(raw["surface"])
+                if live and abs(live - 1500) > 1:
+                    match.p2_elo_at_match = float(live)
+
             match.status      = raw["status"]
             match.p1_sets     = raw["p1_sets"]
             match.p2_sets     = raw["p2_sets"]
@@ -247,38 +268,140 @@ def _market_url(match, p1_name: str, p2_name: str) -> str:
     return _poly_url(p1_name, p2_name)
 
 
+def _resolve_elo(match, side: int) -> tuple[float, str]:
+    """
+    Return (elo, label) for player1 (side=1) or player2 (side=2).
+    Falls back to player.surface_elo() / current_elo when match.p*_elo_at_match
+    is the default stub (1500).  Label is '(no data)' when no real ELO exists.
+    """
+    surface = match.surface
+    if side == 1:
+        stored = match.p1_elo_at_match
+        player = match.player1
+    else:
+        stored = match.p2_elo_at_match
+        player = match.player2
+
+    if stored and abs(stored - 1500) > 1:
+        return float(stored), ""
+
+    if player is not None:
+        live = player.surface_elo(surface)
+        if live and abs(live - 1500) > 1:
+            return float(live), ""
+
+    return 1500.0, " (no data)"
+
+
+def _compute_quick_probability(match, raw):
+    """
+    Run the dual-model calculator inline to get model probabilities for the
+    notification. Returns dict {table, markov, consensus} as P(player1 wins),
+    or None if calculation is not possible.
+    """
+    if not match.player1 or not match.player2:
+        return None
+    try:
+        from app.engine.calculator import calculate, MatchState
+
+        p1_elo, _ = _resolve_elo(match, 1)
+        p2_elo, _ = _resolve_elo(match, 2)
+
+        # Normalise: calculator expects player1 = higher ELO
+        swapped = p2_elo > p1_elo
+        if swapped:
+            a_name, b_name = match.player2.name, match.player1.name
+            a_elo, b_elo   = p2_elo, p1_elo
+            a_sets, b_sets = raw["p2_sets"], raw["p1_sets"]
+            a_g, b_g       = raw.get("p2_games") or 0, raw.get("p1_games") or 0
+            a_p, b_p       = raw.get("p2_pts") or 0, raw.get("p1_pts") or 0
+            srv = (1 - (raw.get("server") or 0))
+        else:
+            a_name, b_name = match.player1.name, match.player2.name
+            a_elo, b_elo   = p1_elo, p2_elo
+            a_sets, b_sets = raw["p1_sets"], raw["p2_sets"]
+            a_g, b_g       = raw.get("p1_games") or 0, raw.get("p2_games") or 0
+            a_p, b_p       = raw.get("p1_pts") or 0, raw.get("p2_pts") or 0
+            srv = raw.get("server") or 0
+
+        state = MatchState(
+            player1_name=a_name, player2_name=b_name,
+            player1_elo=a_elo, player2_elo=b_elo,
+            tour=match.tour, surface=match.surface,
+            p1_sets=a_sets, p2_sets=b_sets,
+            p1_games=a_g, p2_games=b_g,
+            p1_pts=a_p, p2_pts=b_p,
+            server=srv, in_tiebreak=raw.get("in_tiebreak", False),
+        )
+        result = calculate(state=state, polymarket_price=None, min_edge_pp=5.0)
+        if swapped:
+            return {
+                "table":     1.0 - result.table_model.p1_win_prob,
+                "markov":    1.0 - result.markov_model.p1_win_prob,
+                "consensus": 1.0 - result.consensus_prob,
+            }
+        return {
+            "table":     result.table_model.p1_win_prob,
+            "markov":    result.markov_model.p1_win_prob,
+            "consensus": result.consensus_prob,
+        }
+    except Exception as exc:
+        logger.debug(f"quick probability failed: {exc}")
+        return None
+
+
 def _build_live_notification(header: str, raw: dict, match) -> str:
-    """Build a Telegram message for a match going live or a set completing."""
+    """Build a Telegram message that ALWAYS shows our model + Polymarket prices,
+    even when no edge meets the alert threshold.  Lets the user verify the bot
+    is running correctly without waiting for an opportunity."""
     p1 = raw["player1_name"]
     p2 = raw["player2_name"]
+    p1_last = p1.split()[-1]
+    p2_last = p2.split()[-1]
     score = raw.get("score_text") or "-"
     surface_emoji = {"hard": "🔵", "clay": "🟤", "grass": "🟢"}.get(raw["surface"], "⚫")
-    p1_elo = match.p1_elo_at_match or 1500
-    p2_elo = match.p2_elo_at_match or 1500
 
-    # Flag when ELO is missing (default stub value)
-    p1_elo_str = f"{p1_elo:.0f}" if abs(p1_elo - 1500) > 1 else "1500 (no data)"
-    p2_elo_str = f"{p2_elo:.0f}" if abs(p2_elo - 1500) > 1 else "1500 (no data)"
+    p1_elo, p1_elo_tag = _resolve_elo(match, 1)
+    p2_elo, p2_elo_tag = _resolve_elo(match, 2)
+
+    lines = [
+        header,
+        f"🎾 {p1} vs {p2}",
+        f"{surface_emoji} {raw['tour']} | {raw['surface'].capitalize()}"
+        f" | {raw.get('tournament', '')}",
+        f"Score: {score}",
+        f"ELO: {p1_last} {p1_elo:.0f}{p1_elo_tag} vs {p2_last} {p2_elo:.0f}{p2_elo_tag}",
+    ]
+
+    probs = _compute_quick_probability(match, raw)
+    if probs is not None:
+        c1 = probs["consensus"]
+        lines += [
+            f"",
+            f"Our model — P({p1_last} wins):",
+            f"  TABLE  {probs['table']*100:.0f}% | MARKOV {probs['markov']*100:.0f}%"
+            f" | Consensus {c1*100:.0f}%",
+            f"  → {p1_last} {c1*100:.0f}% | {p2_last} {(1-c1)*100:.0f}%",
+        ]
+    else:
+        lines += [f"", f"Our model: not yet computed"]
 
     if match.last_poly_price_p1 is not None:
         pr = match.last_poly_price_p1
-        poly_line = (
-            f"\nPolymarket (ask): {p1.split()[-1]} {pr*100:.0f}% | "
-            f"{p2.split()[-1]} {(1-pr)*100:.0f}%"
-        )
+        lines += [
+            f"",
+            f"Polymarket: {p1_last} {pr*100:.0f}% | {p2_last} {(1-pr)*100:.0f}%",
+        ]
+        if probs is not None:
+            edge = (probs["consensus"] - pr) * 100
+            who = p1_last if edge > 0 else p2_last
+            mark = "🔥" if abs(edge) >= 8 else ("⚡" if abs(edge) >= 5 else "")
+            lines.append(f"Edge: {edge:+.1f}pp on {who} {mark}".rstrip())
     else:
-        poly_line = "\nPolymarket: searching..."
+        lines += [f"", f"Polymarket: searching..."]
 
-    return (
-        f"{header}\n"
-        f"🎾 {p1} vs {p2}\n"
-        f"{surface_emoji} {raw['tour']} | {raw['surface'].capitalize()}"
-        f" | {raw.get('tournament', '')}\n"
-        f"Score: {score}\n"
-        f"ELO: {p1.split()[-1]} {p1_elo_str} vs {p2.split()[-1]} {p2_elo_str}"
-        f"{poly_line}\n"
-        f"{_market_url(match, p1, p2)}"
-    )
+    lines.append(_market_url(match, p1, p2))
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

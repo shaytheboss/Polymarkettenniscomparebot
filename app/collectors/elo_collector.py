@@ -191,33 +191,45 @@ async def _compute_elo_from_github(tour: str) -> list[dict]:
     """
     Compute ELO from Jeff Sackmann's GitHub match data when Tennis Abstract is blocked.
     Downloads the last 3 available years and computes surface ELO using K=32.
-    Returns same row format as _fetch_elo_page.
+
+    Three CSV families per tour are merged so ELO covers newer/lower-ranked players
+    who only appear at qualifying / Challenger / ITF level:
+      ATP: atp_matches_YYYY, atp_matches_qual_chall_YYYY, atp_matches_futures_YYYY
+      WTA: wta_matches_YYYY, wta_matches_qual_itf_YYYY
     """
     tour_lower = tour.lower()
     base = GITHUB_BASE_ATP if tour == "ATP" else GITHUB_BASE_WTA
     current_year = date.today().year
 
-    all_rows: list[dict] = []
-    years_loaded: list[str] = []
+    if tour == "ATP":
+        suffixes = ["", "_qual_chall", "_futures"]
+    else:
+        suffixes = ["", "_qual_itf"]
 
-    # Try last 4 years, accept whatever is available (usually last 3)
+    all_rows: list[dict] = []
+    years_loaded: set[str] = set()
+
     async with httpx.AsyncClient(timeout=40, headers=_HEADERS) as c:
         for year in range(current_year, current_year - 4, -1):
-            url = f"{base}/{tour_lower}_matches_{year}.csv"
-            try:
-                resp = await c.get(url)
-                if resp.status_code == 200:
-                    reader = csv.DictReader(io.StringIO(resp.text))
-                    rows = list(reader)
-                    all_rows.extend(rows)
-                    years_loaded.append(str(year))
-                    logger.info(f"GitHub ELO: loaded {len(rows)} {tour} matches from {year}")
-                elif resp.status_code == 404:
-                    logger.debug(f"GitHub ELO: {tour} {year} not yet published")
-                else:
-                    logger.warning(f"GitHub ELO: {url} → HTTP {resp.status_code}")
-            except Exception as e:
-                logger.warning(f"GitHub ELO: failed to fetch {tour} {year}: {e}")
+            for suffix in suffixes:
+                url = f"{base}/{tour_lower}_matches{suffix}_{year}.csv"
+                try:
+                    resp = await c.get(url)
+                    if resp.status_code == 200:
+                        reader = csv.DictReader(io.StringIO(resp.text))
+                        rows = list(reader)
+                        all_rows.extend(rows)
+                        years_loaded.add(str(year))
+                        logger.info(
+                            f"GitHub ELO: loaded {len(rows)} {tour} matches "
+                            f"from {year}{suffix or ' main'}"
+                        )
+                    elif resp.status_code == 404:
+                        logger.debug(f"GitHub ELO: {tour} {year}{suffix} not published")
+                    else:
+                        logger.warning(f"GitHub ELO: {url} → HTTP {resp.status_code}")
+                except Exception as e:
+                    logger.warning(f"GitHub ELO: failed to fetch {tour} {year}{suffix}: {e}")
 
     if not all_rows:
         logger.error(f"GitHub ELO fallback: no {tour} match data available")
@@ -225,7 +237,7 @@ async def _compute_elo_from_github(tour: str) -> list[dict]:
 
     logger.info(
         f"GitHub ELO: computing from {len(all_rows)} {tour} matches "
-        f"({', '.join(years_loaded)})"
+        f"({', '.join(sorted(years_loaded))})"
     )
 
     # Sort chronologically — tourney_date is YYYYMMDD string, sorts lexicographically
@@ -295,9 +307,10 @@ async def _compute_elo_from_github(tour: str) -> list[dict]:
             "ranking":   player_rank.get(name),
         })
 
+    latest_year = max(years_loaded) if years_loaded else "?"
     logger.info(
         f"GitHub ELO computed: {len(result)} {tour} players "
-        f"(data through end of {years_loaded[0] if years_loaded else '?'})"
+        f"(data through end of {latest_year})"
     )
     return result
 

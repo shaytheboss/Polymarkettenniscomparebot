@@ -11,7 +11,7 @@ from app.config import settings
 from app.bot.handlers import (
     cmd_start, cmd_help, cmd_status, cmd_live,
     cmd_opps, cmd_settings, cmd_set_edge, cmd_set_min_prob, cmd_set_tours,
-    cmd_refresh, cmd_track, cmd_polytest, cmd_setpoly,
+    cmd_refresh, cmd_track, cmd_polytest, cmd_setpoly, cmd_elostats,
 )
 from app.bot.formatters import fmt_opportunity
 
@@ -36,6 +36,7 @@ def get_app() -> Application:
         _app.add_handler(CommandHandler("track",      cmd_track))
         _app.add_handler(CommandHandler("polytest",   cmd_polytest))
         _app.add_handler(CommandHandler("setpoly",    cmd_setpoly))
+        _app.add_handler(CommandHandler("elostats",   cmd_elostats))
     return _app
 
 
