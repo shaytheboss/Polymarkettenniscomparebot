@@ -294,6 +294,9 @@ def _decisive_moment_key(raw: dict) -> str | None:
       Set 2 — set-1 winner leads by 2+ games OR has 5 games in current set.
       Set 3 (decisive, 1-1) — either player leads by 2+ games (min 3) OR has 5 games.
     """
+    if raw.get("in_tiebreak"):
+        return None  # both players at 6 games; tiebreak decides, not game count
+
     p1_sets  = raw["p1_sets"]
     p2_sets  = raw["p2_sets"]
     p1_games = raw.get("p1_games") or 0
@@ -374,7 +377,6 @@ async def job_fetch_polymarket():
     Phase 2 — Per-match discovery: for unlinked matches, search Gamma API
                by player name and store condition ID + token ID + slug.
     """
-    from app.bot.telegram_bot import broadcast_message
     from sqlalchemy.orm import selectinload
 
     async with AsyncSessionLocal() as db:
@@ -405,11 +407,11 @@ async def job_fetch_polymarket():
                     updated_names.append(f"{name}={batch_prices[match.external_id]*100:.0f}%")
             if updated_names:
                 logger.info(f"Batch CLOB prices updated: {', '.join(updated_names)}")
-            # When the batch call succeeded but a known token returned no price, the token is
-            # stale (likely a V2 contract upgrade changed the token ID).  Clear it so Phase 2
-            # re-discovers the current token via Gamma API next cycle.
-            # Only do this when batch_ok=True — a network error must not wipe valid tokens.
-            if batch_ok:
+            # Only clear stale tokens when CLOB proved it can return prices (at least one
+            # came back).  If CLOB returns HTTP 200 with an empty body the format is still
+            # wrong — clearing all tokens would trigger re-discovery every 15 s, spamming
+            # the log and (previously) the Telegram channel.
+            if batch_ok and batch_prices:
                 for m in matches:
                     if getattr(m, "polymarket_token_id", None) and m.external_id not in batch_prices:
                         name = m.player1.name.split()[-1] if m.player1 else m.external_id
@@ -501,25 +503,6 @@ async def job_fetch_polymarket():
                         f"Linked Polymarket market cid={cid} slug={slug} "
                         f"token={token_id} → {p1_name} vs {p2_name}"
                     )
-
-                # Notify when Polymarket is first linked to a live match
-                if newly_linked and price is not None:
-                    direct_url = _market_url(match, p1_name, p2_name)
-                    p1_elo = match.p1_elo_at_match or 1500
-                    p2_elo = match.p2_elo_at_match or 1500
-                    display_price = effective_price if last_trade else price
-                    price_label = "ask" if last_trade else "mid"
-                    msg = (
-                        f"Polymarket linked!\n"
-                        f"🎾 {p1_name} vs {p2_name}\n"
-                        f"{p1_name.split()[-1]}: {display_price*100:.1f}% | "
-                        f"{p2_name.split()[-1]}: {(1-display_price)*100:.1f}%"
-                        f"  ({price_label})\n"
-                        f"ELO: {p1_elo:.0f} vs {p2_elo:.0f}\n"
-                        f"Score: {match.score_text or '-'}\n"
-                        f"{direct_url}"
-                    )
-                    asyncio.ensure_future(broadcast_message(msg))
 
             except Exception as e:
                 logger.warning(f"Polymarket update failed for match {match.id}: {e}")

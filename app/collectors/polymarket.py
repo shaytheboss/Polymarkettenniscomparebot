@@ -418,25 +418,32 @@ async def _get_cached_markets() -> list[dict]:
 # Name matching
 # ---------------------------------------------------------------------------
 
+def _player_score(text: str, name: str) -> float:
+    """Score 0–1 for how well a single player name appears in text."""
+    last = _last_name(name)
+    full = _normalize(name)
+    if last in text:
+        return 1.0
+    if full in text:
+        return 0.8
+    if len(last) >= 4 and last[:4] in text:
+        return 0.4
+    return 0.0
+
+
 def _name_score(question_norm: str, p1: str, p2: str) -> float:
     """Score 0–2: how well both player names appear in the question."""
-    score = 0.0
-    for name in [p1, p2]:
-        last = _last_name(name)
-        full = _normalize(name)
-        if last in question_norm:
-            score += 1.0
-        elif full in question_norm:
-            score += 0.8
-        elif len(last) >= 4 and last[:4] in question_norm:
-            score += 0.4
-    return score
+    return _player_score(question_norm, p1) + _player_score(question_norm, p2)
 
 
 async def search_tennis_markets(player1: str, player2: str) -> list[dict]:
     """
     Find the Polymarket market for this matchup by searching the cached markets.
     Returns candidates sorted by name-match score.
+
+    BOTH players must appear in the market text — this prevents linking a
+    tournament-winner market (or a different match that shares one player name)
+    to the wrong live match.
     """
     all_markets = await _get_cached_markets()
     if not all_markets:
@@ -449,15 +456,16 @@ async def search_tennis_markets(player1: str, player2: str) -> list[dict]:
         away = _normalize(market.get("awayTeam") or "")
         question = _normalize(market.get("question", "") or market.get("title", ""))
 
-        if home and away:
-            # Score against homeTeam/awayTeam fields first
-            combined = f"{home} {away}"
-            score = _name_score(combined, player1, player2)
-        else:
-            score = _name_score(question, player1, player2)
+        combined = f"{home} {away}" if (home and away) else question
 
-        if score >= 1.0:
-            scored.append((score, market))
+        s1 = _player_score(combined, player1)
+        s2 = _player_score(combined, player2)
+
+        # Require BOTH players to have at least a partial match.
+        # A score of 0 for either player means this is the wrong market
+        # (tournament winner, or a different match that shares one player).
+        if s1 > 0 and s2 > 0:
+            scored.append((s1 + s2, market))
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
