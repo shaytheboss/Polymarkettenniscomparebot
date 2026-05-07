@@ -254,18 +254,14 @@ async def _job_fetch_live_scores_inner():
 # Notification helpers
 # ---------------------------------------------------------------------------
 
-def _poly_url(p1_name: str, p2_name: str) -> str:
-    """Generic Polymarket search URL (fallback when slug not available)."""
-    last1 = p1_name.split()[-1]
-    last2 = p2_name.split()[-1]
-    return f"https://polymarket.com/sports/tennis?q={last1}+{last2}"
-
-
-def _market_url(match, p1_name: str, p2_name: str) -> str:
-    """Direct market URL if slug known, otherwise generic search."""
+def _market_url(match) -> str:
+    """Direct Polymarket event URL if the market slug is known; '' otherwise.
+    The previous /sports/tennis?q=... search-URL fallback was misleading —
+    Polymarket doesn't actually serve that route, so we omit the link
+    entirely until job_fetch_polymarket discovers a real slug."""
     if getattr(match, "polymarket_slug", None):
         return f"https://polymarket.com/event/{match.polymarket_slug}"
-    return _poly_url(p1_name, p2_name)
+    return ""
 
 
 def _resolve_elo(match, side: int) -> tuple[float, str]:
@@ -400,7 +396,9 @@ def _build_live_notification(header: str, raw: dict, match) -> str:
     else:
         lines += [f"", f"Polymarket: searching..."]
 
-    lines.append(_market_url(match, p1, p2))
+    url = _market_url(match)
+    if url:
+        lines.append(url)
     return "\n".join(lines)
 
 
@@ -454,37 +452,74 @@ def _decisive_moment_key(raw: dict) -> str | None:
 
 
 def _build_decisive_notification(raw: dict, match, dm_key: str) -> str:
-    p1    = raw["player1_name"]
-    p2    = raw["player2_name"]
+    """Decisive-moment notification — same model + Polymarket layout as the
+    match-start / set-completed notifications, plus a one-line description
+    of which condition triggered."""
+    p1 = raw["player1_name"]
+    p2 = raw["player2_name"]
+    p1_last = p1.split()[-1]
+    p2_last = p2.split()[-1]
     score = raw.get("score_text") or "-"
+    surface_emoji = {"hard": "🔵", "clay": "🟤", "grass": "🟢"}.get(raw["surface"], "⚫")
 
     p1_games = raw.get("p1_games") or 0
     p2_games = raw.get("p2_games") or 0
 
     if "p1" in dm_key:
-        lead_name = p1.split()[-1]
+        lead_name = p1_last
         lead_g, trail_g = p1_games, p2_games
     else:
-        lead_name = p2.split()[-1]
+        lead_name = p2_last
         lead_g, trail_g = p2_games, p1_games
 
-    if "set3" in dm_key:
-        set_label = "decisive set 3"
-    else:
-        set_label = "set 2"
-
+    set_label = "decisive set 3" if "set3" in dm_key else "set 2"
     if "matchpt" in dm_key:
         desc = f"{lead_name} is at {lead_g} games — one game from winning {set_label}"
     else:
         desc = f"{lead_name} leads {lead_g}-{trail_g} in {set_label}"
 
-    return (
-        f"⚡ Decisive moment!\n"
-        f"🎾 {p1} vs {p2}\n"
-        f"{desc}\n"
-        f"Score: {score}\n"
-        f"{_market_url(match, p1, p2)}"
-    )
+    p1_elo, p1_elo_tag = _resolve_elo(match, 1)
+    p2_elo, p2_elo_tag = _resolve_elo(match, 2)
+
+    lines = [
+        "⚡ Decisive moment!",
+        f"🎾 {p1} vs {p2}",
+        f"{surface_emoji} {raw['tour']} | {raw['surface'].capitalize()}"
+        f" | {raw.get('tournament', '')}",
+        desc,
+        f"Score: {score}",
+        f"ELO: {p1_last} {p1_elo:.0f}{p1_elo_tag} vs {p2_last} {p2_elo:.0f}{p2_elo_tag}",
+    ]
+
+    probs = _compute_quick_probability(match, raw)
+    if probs is not None:
+        c1 = probs["consensus"]
+        lines += [
+            "",
+            f"Our model — P({p1_last} wins):",
+            f"  TABLE  {probs['table']*100:.0f}% | MARKOV {probs['markov']*100:.0f}%"
+            f" | Consensus {c1*100:.0f}%",
+            f"  → {p1_last} {c1*100:.0f}% | {p2_last} {(1-c1)*100:.0f}%",
+        ]
+
+    if match.last_poly_price_p1 is not None:
+        pr = match.last_poly_price_p1
+        lines += [
+            "",
+            f"Polymarket: {p1_last} {pr*100:.0f}% | {p2_last} {(1-pr)*100:.0f}%",
+        ]
+        if probs is not None:
+            edge = (probs["consensus"] - pr) * 100
+            who = p1_last if edge > 0 else p2_last
+            mark = "🔥" if abs(edge) >= 8 else ("⚡" if abs(edge) >= 5 else "")
+            lines.append(f"Edge: {edge:+.1f}pp on {who} {mark}".rstrip())
+    else:
+        lines += ["", "Polymarket: searching..."]
+
+    url = _market_url(match)
+    if url:
+        lines.append(url)
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
