@@ -120,19 +120,23 @@ async def _fetch_elo_page(path: str) -> list[dict]:
                     return i
         return None
 
-    name_idx = col_exact(["player", "name"]) or col_contains(["player", "name"])
+    def _col(exact_candidates: list[str], contains_candidates: list[str] = None,
+             excludes: list[str] = None) -> Optional[int]:
+        """Return column index: exact match first, then substring match. Handles idx=0."""
+        idx = col_exact(exact_candidates)
+        if idx is not None:
+            return idx
+        return col_contains(contains_candidates or exact_candidates, excludes)
+
     _surface_terms = ["hard", "clay", "grass", "carpet", "h.", "c.", "g.", "h-", "c-", "g-"]
-    elo_idx = (
-        col_exact(["elo", "overall elo", "overall"])
-        or col_contains(["elo", "overall"], excludes=_surface_terms)
-    )
-    hard_idx = col_exact(["h-elo", "helo", "h.elo", "hard elo"]) or col_contains(["h-elo", "h.elo", "helo"])
-    clay_idx = col_exact(["c-elo", "celo", "c.elo", "clay elo"]) or col_contains(["c-elo", "c.elo", "celo"])
-    grass_idx = col_exact(["g-elo", "gelo", "g.elo", "grass elo"]) or col_contains(["g-elo", "g.elo", "gelo"])
-    rank_idx = (
-        col_exact(["atp rank", "wta rank", "rank", "#", "rk", "ranking"])
-        or col_contains(["rank", "rk"], excludes=["elo"])
-    )
+    name_idx  = _col(["player", "name"])
+    elo_idx   = _col(["elo", "overall elo", "overall"],
+                     ["elo", "overall"], excludes=_surface_terms)
+    hard_idx  = _col(["h-elo", "helo", "h.elo", "hard elo"], ["h-elo", "h.elo", "helo"])
+    clay_idx  = _col(["c-elo", "celo", "c.elo", "clay elo"], ["c-elo", "c.elo", "celo"])
+    grass_idx = _col(["g-elo", "gelo", "g.elo", "grass elo"], ["g-elo", "g.elo", "gelo"])
+    rank_idx  = _col(["atp rank", "wta rank", "rank", "#", "rk", "ranking"],
+                     ["rank", "rk"], excludes=["elo"])
 
     logger.info(
         f"ELO columns — name:{name_idx} elo:{elo_idx} "

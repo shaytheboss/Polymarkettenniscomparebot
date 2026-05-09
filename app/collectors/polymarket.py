@@ -352,14 +352,49 @@ async def fetch_last_trade_prices(token_ids: list[str]) -> dict[str, float]:
 # Gamma API market discovery
 # ---------------------------------------------------------------------------
 
+async def _fetch_event_by_slug(slug: str) -> Optional[dict]:
+    """
+    Fetch a single event by slug — slug-based fetches return fully populated markets[].
+    The bulk /events?tag_id= query returns events with empty markets[], so we
+    re-fetch each event individually to get the actual market data.
+    """
+    try:
+        async with _client() as c:
+            resp = await c.get(_gamma_url("/events"), params={"slug": slug})
+            resp.raise_for_status()
+            data = resp.json()
+        events = data if isinstance(data, list) else data.get("data", [])
+        return events[0] if events else None
+    except Exception as e:
+        logger.debug(f"slug fetch failed for {slug}: {e}")
+        return None
+
+
+def _flatten_markets(events: list[dict]) -> list[dict]:
+    """Flatten event list into individual match markets, attaching _event_slug."""
+    markets: list[dict] = []
+    for event in events:
+        event_slug = event.get("slug", "")
+        for item in event.get("markets", []):
+            item = dict(item)
+            item["_event_slug"] = event_slug
+            if not item.get("question") and (item.get("homeTeam") or item.get("awayTeam")):
+                item["question"] = f"{item.get('homeTeam', '')} vs {item.get('awayTeam', '')}"
+            if _is_match_market(item):
+                markets.append(item)
+    return markets
+
+
 async def _fetch_tennis_events(limit: int = 100) -> list[dict]:
     """
     Fetch active tennis markets via /events?tag_id=864.
 
-    The /events endpoint returns event objects with a nested "markets" array.
-    We flatten them into individual market dicts and attach _event_slug so we
-    can build the correct URL: https://polymarket.com/event/{_event_slug}.
+    The bulk /events endpoint now returns events with empty markets[] arrays.
+    Fix: collect slugs from the bulk response, then re-fetch each event
+    individually by slug — slug fetches return fully populated markets[].
     """
+    import asyncio as _asyncio
+
     params: dict = {"tag_id": 864, "active": "true", "closed": "false", "limit": limit}
 
     try:
@@ -377,20 +412,29 @@ async def _fetch_tennis_events(limit: int = 100) -> list[dict]:
         return []
 
     events = data if isinstance(data, list) else data.get("data", [])
-    markets: list[dict] = []
+    if not events:
+        return []
 
-    for event in events:
-        event_slug = event.get("slug", "")
-        for item in event.get("markets", []):
-            item = dict(item)
-            item["_event_slug"] = event_slug
-            if not item.get("question") and (item.get("homeTeam") or item.get("awayTeam")):
-                item["question"] = f"{item.get('homeTeam', '')} vs {item.get('awayTeam', '')}"
-            # Only cache head-to-head match markets — skip tournament winner markets
-            # (e.g., "Will Draper win the Australian Open?") which have no opponent
-            if _is_match_market(item):
-                markets.append(item)
+    # Fast path: bulk response already has populated markets (old API behaviour)
+    if any(e.get("markets") for e in events):
+        logger.debug(f"tag_id=864: {len(events)} events with inline markets")
+        return _flatten_markets(events)
 
+    # Slow path: bulk response returns empty markets[] — re-fetch each by slug.
+    # This is the same two-step pattern used by the weather bot for /events?q= searches.
+    slugs = [e["slug"] for e in events if e.get("slug")]
+    if not slugs:
+        logger.warning("Polymarket /events?tag_id=864 returned events with no slugs")
+        return []
+
+    logger.info(
+        f"tag_id=864: {len(events)} events, markets[] empty — "
+        f"re-fetching {len(slugs)} events by slug"
+    )
+    fetched = await _asyncio.gather(*[_fetch_event_by_slug(s) for s in slugs])
+    full_events = [e for e in fetched if e is not None]
+    markets = _flatten_markets(full_events)
+    logger.info(f"Slug re-fetch complete: {len(full_events)}/{len(slugs)} events → {len(markets)} match markets")
     return markets
 
 
@@ -771,7 +815,7 @@ async def test_connectivity() -> dict:
         "endpoint": _gamma_url("/events"),
     }
 
-    # Test Gamma API
+    # Test Gamma API — uses the same slug-based two-step fetch as the real cache
     try:
         async with _client(timeout=15.0) as c:
             resp = await c.get(
@@ -782,9 +826,19 @@ async def test_connectivity() -> dict:
             if resp.status_code == 200:
                 data = resp.json()
                 events = data if isinstance(data, list) else data.get("data", [])
+                # Try inline markets first; fall back to slug re-fetch if empty
                 all_markets = [m for e in events for m in e.get("markets", [])]
+                if not all_markets and events:
+                    result["slug_refetch"] = True
+                    slugs = [e["slug"] for e in events if e.get("slug")][:3]
+                    import asyncio as _aio
+                    fetched = await _aio.gather(*[_fetch_event_by_slug(s) for s in slugs])
+                    all_markets = [
+                        m for e in fetched if e for m in e.get("markets", [])
+                    ]
                 result["ok"] = True
                 result["markets_found"] = len(all_markets)
+                result["events_found"] = len(events)
                 if all_markets:
                     m = all_markets[0]
                     q = m.get("question") or f"{m.get('homeTeam','')} vs {m.get('awayTeam','')}"
@@ -803,7 +857,7 @@ async def test_connectivity() -> dict:
         result["clob_ok"] = False
 
     # Test CLOB price fetch — try all 4 formats with a real token from Gamma cache.
-    # This tells us exactly which format works so we know what to fix next.
+    # Use the slug-based fetch to find a token when inline markets are empty.
     if result["clob_ok"] and result.get("ok"):
         test_token: Optional[str] = None
         try:
@@ -824,6 +878,21 @@ async def test_connectivity() -> dict:
                                 break
                         if test_token:
                             break
+                    # Slug re-fetch fallback for token discovery
+                    if not test_token and events2:
+                        slugs2 = [e["slug"] for e in events2 if e.get("slug")][:2]
+                        import asyncio as _aio2
+                        fetched2 = await _aio2.gather(*[_fetch_event_by_slug(s) for s in slugs2])
+                        for ev2f in fetched2:
+                            if not ev2f:
+                                continue
+                            for mkt in ev2f.get("markets", []):
+                                tokens = _extract_token_ids(mkt)
+                                if tokens:
+                                    test_token = tokens[0]
+                                    break
+                            if test_token:
+                                break
         except Exception:
             pass
 
