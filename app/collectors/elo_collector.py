@@ -344,6 +344,20 @@ async def refresh_elo(tour: str, db: AsyncSession) -> int:
         logger.error(f"All ELO sources failed for {tour}")
         return 0
 
+    # One-time heal: backfill name_last for any existing players that are missing it.
+    # Players created before migration 002 may have name_last=NULL, which silently
+    # bypasses the fast last-name index in find_player_by_name() and forces a full
+    # table scan that can miss matches at the fuzzy threshold.
+    missing_result = await db.execute(
+        select(Player).where(Player.name_last.is_(None), Player.tour == tour)
+    )
+    missing_players = missing_result.scalars().all()
+    if missing_players:
+        for p in missing_players:
+            p.name_last = _last_name(p.name)
+        await db.flush()
+        logger.info(f"Backfilled name_last for {len(missing_players)} {tour} players")
+
     today = date.today()
     updated = 0
 
