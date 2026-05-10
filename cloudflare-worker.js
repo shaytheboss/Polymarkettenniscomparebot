@@ -67,11 +67,15 @@ export default {
     const targetUrl = `https://${targetHost}${targetPath}`;
     const headers = isTennis ? TENNIS_HEADERS : POLYMARKET_HEADERS;
 
+    // Forward the original request method and body so POST /prices works correctly.
+    // Previously hardcoded to GET which silently broke CLOB batch price fetches.
+    const isBodyMethod = !["GET", "HEAD"].includes(request.method);
     let response;
     try {
       response = await fetch(targetUrl, {
-        method: "GET",
+        method: request.method,
         headers,
+        body: isBodyMethod ? request.body : undefined,
         redirect: "follow",
       });
     } catch (err) {

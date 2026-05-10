@@ -385,17 +385,15 @@ def _flatten_markets(events: list[dict]) -> list[dict]:
     return markets
 
 
-async def _fetch_tennis_events(limit: int = 100) -> list[dict]:
+async def _fetch_events_with_params(extra_params: dict, limit: int) -> list[dict]:
     """
-    Fetch active tennis markets via /events?tag_id=864.
-
-    The bulk /events endpoint now returns events with empty markets[] arrays.
-    Fix: collect slugs from the bulk response, then re-fetch each event
-    individually by slug — slug fetches return fully populated markets[].
+    Core helper: fetch Gamma /events with given filter params, return flat match-market list.
+    Handles the empty-markets slug re-fetch pattern automatically.
     """
     import asyncio as _asyncio
 
-    params: dict = {"tag_id": 864, "active": "true", "closed": "false", "limit": limit}
+    params: dict = {"active": "true", "closed": "false", "limit": limit, **extra_params}
+    label = str(extra_params)
 
     try:
         async with _client() as c:
@@ -404,38 +402,97 @@ async def _fetch_tennis_events(limit: int = 100) -> list[dict]:
             data = resp.json()
     except httpx.HTTPStatusError as e:
         _cache["last_error"] = f"Gamma HTTP {e.response.status_code}: {e.response.text[:60]}"
-        logger.warning(f"Polymarket /events HTTP {e.response.status_code}")
+        logger.warning(f"Polymarket /events {label} HTTP {e.response.status_code}")
         return []
     except Exception as e:
         _cache["last_error"] = f"Gamma {type(e).__name__}: {e}"
-        logger.warning(f"Polymarket /events error: {e}")
+        logger.warning(f"Polymarket /events {label} error: {e}")
         return []
 
     events = data if isinstance(data, list) else data.get("data", [])
     if not events:
+        logger.debug(f"Polymarket /events {label}: 0 events returned")
         return []
 
-    # Fast path: bulk response already has populated markets (old API behaviour)
+    # Fast path: inline markets already populated
     if any(e.get("markets") for e in events):
-        logger.debug(f"tag_id=864: {len(events)} events with inline markets")
-        return _flatten_markets(events)
+        markets = _flatten_markets(events)
+        logger.debug(f"Polymarket {label}: {len(events)} events, inline markets → {len(markets)} match markets")
+        return markets
 
-    # Slow path: bulk response returns empty markets[] — re-fetch each by slug.
-    # This is the same two-step pattern used by the weather bot for /events?q= searches.
+    # Slow path: bulk response has empty markets[] — re-fetch each event by slug
     slugs = [e["slug"] for e in events if e.get("slug")]
     if not slugs:
-        logger.warning("Polymarket /events?tag_id=864 returned events with no slugs")
+        logger.warning(f"Polymarket {label}: events returned but none have slugs")
         return []
 
     logger.info(
-        f"tag_id=864: {len(events)} events, markets[] empty — "
-        f"re-fetching {len(slugs)} events by slug"
+        f"Polymarket {label}: {len(events)} events, markets[] empty — "
+        f"re-fetching {len(slugs)} by slug"
     )
     fetched = await _asyncio.gather(*[_fetch_event_by_slug(s) for s in slugs])
     full_events = [e for e in fetched if e is not None]
     markets = _flatten_markets(full_events)
-    logger.info(f"Slug re-fetch complete: {len(full_events)}/{len(slugs)} events → {len(markets)} match markets")
+    logger.info(
+        f"Polymarket {label} slug re-fetch: {len(full_events)}/{len(slugs)} events "
+        f"→ {len(markets)} match markets"
+    )
     return markets
+
+
+async def _search_events_by_player(player_name: str) -> list[dict]:
+    """
+    Search for events containing a player's last name — fallback when tag-based
+    discovery fails.  Uses /events?q={name} text search against Gamma API.
+    """
+    import asyncio as _asyncio
+
+    last = _last_name(player_name)
+    if not last or len(last) < 3:
+        return []
+    try:
+        async with _client() as c:
+            resp = await c.get(
+                _gamma_url("/events"),
+                params={"q": last, "limit": 10, "active": "true", "closed": "false"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        events = data if isinstance(data, list) else data.get("data", [])
+        if not events:
+            return []
+        # Re-fetch by slug when inline markets are empty
+        if not any(e.get("markets") for e in events):
+            slugs = [e["slug"] for e in events if e.get("slug")][:5]
+            fetched = await _asyncio.gather(*[_fetch_event_by_slug(s) for s in slugs])
+            events = [e for e in fetched if e is not None]
+        return _flatten_markets(events)
+    except Exception as e:
+        logger.debug(f"Polymarket player-name search '{last}' failed: {e}")
+        return []
+
+
+async def _fetch_tennis_events(limit: int = 100) -> list[dict]:
+    """
+    Fetch active tennis markets using multiple discovery strategies in order:
+      1. /events?tag_id=864 — primary tennis tag
+      2. /events?tag_slug=tennis — alternative tag parameter (API v2 support)
+
+    Each strategy applies the same inline-markets fast path / slug-re-fetch slow path.
+    """
+    # Strategy 1: tag_id=864
+    markets = await _fetch_events_with_params({"tag_id": 864}, limit)
+    if markets:
+        return markets
+
+    # Strategy 2: tag_slug=tennis
+    logger.info("tag_id=864 returned no match markets — trying tag_slug=tennis")
+    markets = await _fetch_events_with_params({"tag_slug": "tennis"}, limit)
+    if markets:
+        return markets
+
+    logger.warning("All Polymarket tennis discovery strategies returned no markets")
+    return []
 
 
 def _is_match_market(market: dict) -> bool:
@@ -499,8 +556,24 @@ async def search_tennis_markets(player1: str, player2: str) -> list[dict]:
     BOTH players must appear in the market text — this prevents linking a
     tournament-winner market (or a different match that shares one player name)
     to the wrong live match.
+
+    When the tag-based cache is empty (API unreachable or no active events),
+    falls back to a direct player-name text search against the Gamma API.
     """
     all_markets = await _get_cached_markets()
+
+    # Direct player-name search fallback when tag-based discovery found nothing
+    if not all_markets:
+        logger.info(
+            f"Polymarket cache empty — trying direct player search "
+            f"for {player1} vs {player2}"
+        )
+        for player in [player1, player2]:
+            extra = await _search_events_by_player(player)
+            if extra:
+                all_markets = extra
+                break
+
     if not all_markets:
         return []
 
@@ -815,8 +888,11 @@ async def test_connectivity() -> dict:
         "endpoint": _gamma_url("/events"),
     }
 
-    # Test Gamma API — uses the same slug-based two-step fetch as the real cache
+    # Test Gamma API — try tag_id=864 first, fall back to tag_slug=tennis.
+    # Uses the same slug re-fetch logic as the live cache.
+    discovery_strategy: Optional[str] = None
     try:
+        # Quick probe: just check HTTP status with tag_id=864
         async with _client(timeout=15.0) as c:
             resp = await c.get(
                 _gamma_url("/events"),
@@ -824,29 +900,36 @@ async def test_connectivity() -> dict:
             )
             result["http_status"] = resp.status_code
             if resp.status_code == 200:
-                data = resp.json()
-                events = data if isinstance(data, list) else data.get("data", [])
-                # Try inline markets first; fall back to slug re-fetch if empty
-                all_markets = [m for e in events for m in e.get("markets", [])]
-                if not all_markets and events:
-                    result["slug_refetch"] = True
-                    slugs = [e["slug"] for e in events if e.get("slug")][:3]
-                    import asyncio as _aio
-                    fetched = await _aio.gather(*[_fetch_event_by_slug(s) for s in slugs])
-                    all_markets = [
-                        m for e in fetched if e for m in e.get("markets", [])
-                    ]
                 result["ok"] = True
-                result["markets_found"] = len(all_markets)
-                result["events_found"] = len(events)
-                if all_markets:
-                    m = all_markets[0]
-                    q = m.get("question") or f"{m.get('homeTeam','')} vs {m.get('awayTeam','')}"
-                    result["sample_question"] = q[:80]
     except Exception as e:
         result["http_status"] = f"{type(e).__name__}: {e}"
 
-    # Test CLOB API reachability via /markets (unauthenticated, low-cost check)
+    # If HTTP is reachable, run full market discovery using the same helper as production
+    if result.get("ok"):
+        markets_864 = await _fetch_events_with_params({"tag_id": 864}, limit=5)
+        if markets_864:
+            discovery_strategy = "tag_id=864"
+            result["markets_found"] = len(markets_864)
+            m = markets_864[0]
+            result["sample_question"] = (
+                m.get("question") or
+                f"{m.get('homeTeam','')} vs {m.get('awayTeam','')}"
+            )[:80]
+        else:
+            # Fallback strategy: tag_slug=tennis
+            markets_slug = await _fetch_events_with_params({"tag_slug": "tennis"}, limit=5)
+            if markets_slug:
+                discovery_strategy = "tag_slug=tennis"
+                result["markets_found"] = len(markets_slug)
+                m = markets_slug[0]
+                result["sample_question"] = (
+                    m.get("question") or
+                    f"{m.get('homeTeam','')} vs {m.get('awayTeam','')}"
+                )[:80]
+
+        result["discovery_strategy"] = discovery_strategy or "none worked"
+
+    # Test CLOB API reachability
     try:
         async with _client(timeout=10.0) as c:
             resp = await c.get(_clob_url("/markets"), params={"limit": 1})
@@ -856,43 +939,54 @@ async def test_connectivity() -> dict:
         result["clob_status"] = f"{type(e).__name__}: {str(e)[:60]}"
         result["clob_ok"] = False
 
-    # Test CLOB price fetch — try all 4 formats with a real token from Gamma cache.
-    # Use the slug-based fetch to find a token when inline markets are empty.
+    # Test CLOB price fetch — find a real token from the discovery above
     if result["clob_ok"] and result.get("ok"):
         test_token: Optional[str] = None
         try:
-            async with _client(timeout=12.0) as c:
-                resp2 = await c.get(
-                    _gamma_url("/events"),
-                    params={"tag_id": 864, "active": "true", "closed": "false", "limit": 3},
-                )
-                if resp2.status_code == 200:
-                    events2 = resp2.json()
-                    if isinstance(events2, dict):
-                        events2 = events2.get("data", [])
-                    for ev2 in events2:
-                        for mkt in ev2.get("markets", []):
-                            tokens = _extract_token_ids(mkt)
-                            if tokens:
-                                test_token = tokens[0]
-                                break
-                        if test_token:
-                            break
-                    # Slug re-fetch fallback for token discovery
-                    if not test_token and events2:
-                        slugs2 = [e["slug"] for e in events2 if e.get("slug")][:2]
-                        import asyncio as _aio2
-                        fetched2 = await _aio2.gather(*[_fetch_event_by_slug(s) for s in slugs2])
-                        for ev2f in fetched2:
-                            if not ev2f:
-                                continue
-                            for mkt in ev2f.get("markets", []):
+            # Reuse whatever strategy worked for discovery
+            params_to_try = (
+                [{"tag_id": 864}, {"tag_slug": "tennis"}]
+                if discovery_strategy != "tag_slug=tennis"
+                else [{"tag_slug": "tennis"}, {"tag_id": 864}]
+            )
+            for params in params_to_try:
+                async with _client(timeout=12.0) as c:
+                    resp2 = await c.get(
+                        _gamma_url("/events"),
+                        params={"active": "true", "closed": "false", "limit": 3, **params},
+                    )
+                    if resp2.status_code == 200:
+                        events2 = resp2.json()
+                        if isinstance(events2, dict):
+                            events2 = events2.get("data", [])
+                        # Gather tokens from inline markets
+                        for ev2 in events2:
+                            for mkt in ev2.get("markets", []):
                                 tokens = _extract_token_ids(mkt)
                                 if tokens:
                                     test_token = tokens[0]
                                     break
                             if test_token:
                                 break
+                        # Slug re-fetch if inline markets are empty
+                        if not test_token and events2:
+                            import asyncio as _aio2
+                            slugs2 = [e["slug"] for e in events2 if e.get("slug")][:2]
+                            fetched2 = await _aio2.gather(
+                                *[_fetch_event_by_slug(s) for s in slugs2]
+                            )
+                            for ev2f in fetched2:
+                                if not ev2f:
+                                    continue
+                                for mkt in ev2f.get("markets", []):
+                                    tokens = _extract_token_ids(mkt)
+                                    if tokens:
+                                        test_token = tokens[0]
+                                        break
+                                if test_token:
+                                    break
+                if test_token:
+                    break
         except Exception:
             pass
 
@@ -905,10 +999,10 @@ async def test_connectivity() -> dict:
 
             async with _client(timeout=10.0) as c:
                 probe_tests = [
-                    ("POST /prices JSON",     lambda: c.post(_clob_url("/prices"), json=[{"token_id": test_token, "side": "BUY"}])),
-                    ("GET /prices+side=BUY",  lambda: c.get(_clob_url("/prices"), params=[("token_id", test_token), ("side", "BUY")])),
-                    ("GET /price?side=BUY",   lambda: c.get(_clob_url("/price"),  params={"token_id": test_token, "side": "BUY"})),
-                    ("GET /book (mid)",       lambda: c.get(_clob_url("/book"),   params={"token_id": test_token})),
+                    ("POST /prices JSON",    lambda: c.post(_clob_url("/prices"), json=[{"token_id": test_token, "side": "BUY"}])),
+                    ("GET /prices+side=BUY", lambda: c.get(_clob_url("/prices"), params=[("token_id", test_token), ("side", "BUY")])),
+                    ("GET /price?side=BUY",  lambda: c.get(_clob_url("/price"),  params={"token_id": test_token, "side": "BUY"})),
+                    ("GET /book (mid)",      lambda: c.get(_clob_url("/book"),   params={"token_id": test_token})),
                 ]
                 for fmt_name, call in probe_tests:
                     try:
@@ -916,7 +1010,6 @@ async def test_connectivity() -> dict:
                         formats_tried.append(f"{fmt_name}→{r.status_code}")
                         if r.status_code == 200:
                             body = r.json()
-                            # /book: extract mid from bids/asks
                             if fmt_name.startswith("GET /book"):
                                 bids = body.get("bids", [])
                                 asks = body.get("asks", [])
@@ -931,9 +1024,8 @@ async def test_connectivity() -> dict:
                                     working_price = f"{list(parsed.values())[0]:.3f}"
                                     working_format = fmt_name
                                     break
-                                # 200 but no prices — token not in CLOB
                                 elif r.status_code == 200:
-                                    working_format = f"{fmt_name} (200, no price for test token)"
+                                    working_format = f"{fmt_name} (200, no price for token)"
                                     break
                     except Exception as exc:
                         formats_tried.append(f"{fmt_name}→ERR:{str(exc)[:30]}")
