@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
+from typing import Optional
 
 from sqlalchemy import select
 
@@ -268,7 +269,8 @@ def _resolve_elo(match, side: int) -> tuple[float, str]:
     """
     Return (elo, label) for player1 (side=1) or player2 (side=2).
     Falls back to player.surface_elo() / current_elo when match.p*_elo_at_match
-    is the default stub (1500).  Label is '(no data)' when no real ELO exists.
+    is the default stub (1500), then to data/elo_*_manual.tsv as a final fallback.
+    Label is '(no data)' when no real ELO exists in any source.
     """
     surface = match.surface
     if side == 1:
@@ -286,7 +288,48 @@ def _resolve_elo(match, side: int) -> tuple[float, str]:
         if live and abs(live - 1500) > 1:
             return float(live), ""
 
+    # Final fallback: manual ELO file
+    if player is not None:
+        from app.collectors.manual_elo import manual_elo_for_surface
+        manual = manual_elo_for_surface(player.name, match.tour, surface)
+        if manual is not None and abs(manual - 1500) > 1:
+            return float(manual), " (manual)"
+
     return 1500.0, " (no data)"
+
+
+def _resolve_manual_elo(match, side: int) -> Optional[float]:
+    """Return surface-specific manual ELO for the player, or None if absent."""
+    from app.collectors.manual_elo import manual_elo_for_surface
+    player = match.player1 if side == 1 else match.player2
+    if player is None:
+        return None
+    return manual_elo_for_surface(player.name, match.tour, match.surface)
+
+
+def _format_elo_line(p1_last: str, p2_last: str, match) -> str:
+    """
+    Build the ELO line for notifications. Shows manual ELO alongside auto
+    ELO when the manual file has the player.
+
+    Format when both available:  ELO: Sinner 2150 [m:2331] vs Alcaraz 2080 [m:2271]
+    Format when only auto:       ELO: Sinner 2150 vs Alcaraz 2080
+    """
+    p1_elo, p1_tag = _resolve_elo(match, 1)
+    p2_elo, p2_tag = _resolve_elo(match, 2)
+    p1_manual = _resolve_manual_elo(match, 1)
+    p2_manual = _resolve_manual_elo(match, 2)
+
+    def _side(name: str, auto_elo: float, auto_tag: str, manual: Optional[float]) -> str:
+        # Don't double-show "(manual)" when the auto already came from the manual file
+        if manual is not None and "(manual)" not in auto_tag:
+            return f"{name} {auto_elo:.0f}{auto_tag} [m:{manual:.0f}]"
+        return f"{name} {auto_elo:.0f}{auto_tag}"
+
+    return (
+        f"ELO: {_side(p1_last, p1_elo, p1_tag, p1_manual)}"
+        f" vs {_side(p2_last, p2_elo, p2_tag, p2_manual)}"
+    )
 
 
 def _compute_quick_probability(match, raw):
@@ -357,16 +400,13 @@ def _build_live_notification(header: str, raw: dict, match) -> str:
     score = raw.get("score_text") or "-"
     surface_emoji = {"hard": "🔵", "clay": "🟤", "grass": "🟢"}.get(raw["surface"], "⚫")
 
-    p1_elo, p1_elo_tag = _resolve_elo(match, 1)
-    p2_elo, p2_elo_tag = _resolve_elo(match, 2)
-
     lines = [
         header,
         f"🎾 {p1} vs {p2}",
         f"{surface_emoji} {raw['tour']} | {raw['surface'].capitalize()}"
         f" | {raw.get('tournament', '')}",
         f"Score: {score}",
-        f"ELO: {p1_last} {p1_elo:.0f}{p1_elo_tag} vs {p2_last} {p2_elo:.0f}{p2_elo_tag}",
+        _format_elo_line(p1_last, p2_last, match),
     ]
 
     probs = _compute_quick_probability(match, raw)
@@ -478,9 +518,6 @@ def _build_decisive_notification(raw: dict, match, dm_key: str) -> str:
     else:
         desc = f"{lead_name} leads {lead_g}-{trail_g} in {set_label}"
 
-    p1_elo, p1_elo_tag = _resolve_elo(match, 1)
-    p2_elo, p2_elo_tag = _resolve_elo(match, 2)
-
     lines = [
         "⚡ Decisive moment!",
         f"🎾 {p1} vs {p2}",
@@ -488,7 +525,7 @@ def _build_decisive_notification(raw: dict, match, dm_key: str) -> str:
         f" | {raw.get('tournament', '')}",
         desc,
         f"Score: {score}",
-        f"ELO: {p1_last} {p1_elo:.0f}{p1_elo_tag} vs {p2_last} {p2_elo:.0f}{p2_elo_tag}",
+        _format_elo_line(p1_last, p2_last, match),
     ]
 
     probs = _compute_quick_probability(match, raw)

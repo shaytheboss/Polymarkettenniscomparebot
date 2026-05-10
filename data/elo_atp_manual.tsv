@@ -1,0 +1,18 @@
+# Manual ATP ELO ratings — paste rows from Tennis Abstract / similar source below.
+#
+# Format: tab-separated columns matching the source page layout.
+# The parser handles the standard Tennis Abstract export which has these
+# tab-separated columns (some are blank-spacer columns between groups):
+#
+#   Elo Rank	Player	Age	Elo	  	hElo Rank	hElo	cElo Rank	cElo	gElo Rank	gElo	  	Peak Elo	Peak Month	  	ATP Rank	Log diff
+#
+# Lines starting with "#" are ignored. Empty lines are ignored. The header
+# row is detected by the literal word "Player" and skipped. Just paste the
+# rows below this comment block — one player per line, exactly as copied
+# from the source.
+#
+# Example row:
+#   1	Jannik Sinner	24.6	2331.1		1	2268.9	1	2222.5	2	2094.0		2331.1	2026-04		1	0
+#
+# To update: paste the entire table here, commit, and push. The bot reads
+# this file at startup and refreshes it every time job_refresh_elo() runs.
