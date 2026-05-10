@@ -33,6 +33,9 @@ _cache: dict[str, dict] = {"ATP": {}, "WTA": {}}
 _cache_mtime: dict[str, float] = {"ATP": 0.0, "WTA": 0.0}
 _lock = threading.Lock()
 
+# Diagnostic: track names that failed lookup so we don't log the same one twice
+_missed_names: dict[str, set[str]] = {"ATP": set(), "WTA": set()}
+
 
 def _path(tour: str) -> Path:
     return ATP_PATH if tour == "ATP" else WTA_PATH
@@ -132,6 +135,8 @@ def _ensure_loaded(tour: str) -> dict[str, dict]:
         if mtime != _cache_mtime[tour] or not _cache[tour]:
             _cache[tour] = _load_file(tour)
             _cache_mtime[tour] = mtime
+            # Clear miss log so newly-added players get retried (and previous misses re-logged)
+            _missed_names[tour] = set()
             if _cache[tour]:
                 logger.info(
                     f"Loaded manual ELO for {tour}: {len(_cache[tour])} players from {path.name}"
@@ -139,14 +144,25 @@ def _ensure_loaded(tour: str) -> dict[str, dict]:
         return _cache[tour]
 
 
+def _name_tokens(name: str) -> set[str]:
+    """Significant tokens (≥3 chars, lowercase, accent-stripped) from a player name."""
+    return {t for t in _normalize(name).split() if len(t) >= 3}
+
+
 def lookup(name: str, tour: str) -> Optional[dict]:
     """
     Look up manual ELO for a player by name. Returns the row dict or None.
 
-    Strategy:
+    Strategy (most strict to most permissive):
       1. Exact normalized name match
       2. Last-name exact match (handles "C. Alcaraz" ↔ "Carlos Alcaraz")
-      3. Fuzzy match across all loaded names
+      3. Token-overlap match — any TSV name sharing a 3+ char token with the
+         query (handles "Carlos Alcaraz" ↔ "Carlos Alcaraz Garfia",
+         "Auger Aliassime" ↔ "Auger-Aliassime", and similar mismatches where
+         neither last-word nor exact match works because of compound names)
+      4. Fuzzy match (lowered to 0.70 threshold for better recall)
+
+    Logs a single warning per unique missing name to help diagnose coverage gaps.
     """
     rows = _ensure_loaded(tour)
     if not rows:
@@ -163,22 +179,51 @@ def lookup(name: str, tour: str) -> Optional[dict]:
         if len(last_matches) == 1:
             return last_matches[0]
         if len(last_matches) > 1:
-            # Disambiguate via fuzzy on full name
             names = [r["name"] for r in last_matches]
-            picked = match_name(name, names, threshold=0.75)
+            picked = match_name(name, names, threshold=0.70)
             if picked:
                 for r in last_matches:
                     if r["name"] == picked:
                         return r
             return last_matches[0]
 
-    # Full fuzzy fallback
+    # Token-overlap match — handles compound surnames and name-order differences.
+    # We require at least one token of length 4+ to overlap to avoid false positives
+    # on common short tokens.
+    target_tokens = _name_tokens(name)
+    long_target_tokens = {t for t in target_tokens if len(t) >= 4}
+    if long_target_tokens:
+        token_matches = []
+        for r in rows.values():
+            row_tokens = _name_tokens(r["name"])
+            shared = long_target_tokens & row_tokens
+            if shared:
+                token_matches.append((len(shared), r))
+        if token_matches:
+            token_matches.sort(key=lambda x: x[0], reverse=True)
+            best_score = token_matches[0][0]
+            top = [r for s, r in token_matches if s == best_score]
+            if len(top) == 1:
+                return top[0]
+            picked = match_name(name, [r["name"] for r in top], threshold=0.70)
+            if picked:
+                for r in top:
+                    if r["name"] == picked:
+                        return r
+            return top[0]
+
+    # Full fuzzy fallback (lowered threshold)
     all_names = [r["name"] for r in rows.values()]
-    picked = match_name(name, all_names, threshold=0.80)
+    picked = match_name(name, all_names, threshold=0.70)
     if picked:
         for r in rows.values():
             if r["name"] == picked:
                 return r
+
+    # Log misses once per name so user can see coverage gaps in logs
+    if name not in _missed_names[tour]:
+        _missed_names[tour].add(name)
+        logger.info(f"Manual ELO miss [{tour}]: '{name}' (last='{target_last}') — not in {len(rows)} rows")
 
     return None
 
