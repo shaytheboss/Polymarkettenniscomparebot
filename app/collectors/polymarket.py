@@ -1055,19 +1055,45 @@ async def test_connectivity() -> dict:
     except Exception as e:
         result["http_status"] = f"{type(e).__name__}: {e}"
 
-    # Full H2H discovery (same logic as live cache refresh — first 2 pages only for speed)
+    # Full H2H discovery (same logic as live cache refresh)
+    records: list[dict] = []
     if result.get("ok"):
         raw_events = await _fetch_tennis_match_events()
         records = _flatten_markets(raw_events)
         result["markets_found"] = len(records)
         result["events_scanned"] = len(raw_events)
         if records:
-            m = records[0]
+            # Show the NEWEST match as sample (slugs sort lexicographically — date suffix → newest last)
+            all_slugs = sorted(r.get("_event_slug", "") for r in records if r.get("_event_slug"))
+            newest_slug = all_slugs[-1] if all_slugs else ""
+            oldest_slug = all_slugs[0] if all_slugs else ""
+            result["oldest_slug"] = oldest_slug
+            result["newest_slug"] = newest_slug
+            result["recent_slugs"] = all_slugs[-10:]  # 10 newest slugs (most recent)
+
+            # Month distribution: YYYY-MM → count
+            from collections import Counter
+            import datetime as _dt
+            month_counter: Counter = Counter()
+            for s in all_slugs:
+                parts = s.rsplit("-", 3)
+                if len(parts) >= 4:
+                    month_counter[f"{parts[-3]}-{parts[-2]}"] += 1
+            result["month_dist"] = dict(sorted(month_counter.items()))
+            current_month = _dt.date.today().strftime("%Y-%m")
+            result["current_month"] = current_month
+            result["current_month_count"] = month_counter.get(current_month, 0)
+            result["atp_count"] = sum(1 for r in records if r.get("tour", "").upper() == "ATP")
+            result["wta_count"] = sum(1 for r in records if r.get("tour", "").upper() == "WTA")
+
+            newest_rec = next(
+                (r for r in records if r.get("_event_slug") == newest_slug), records[-1]
+            )
             result["sample_question"] = (
-                m.get("question") or
-                f"{m.get('homeTeam', '')} vs {m.get('awayTeam', '')}"
+                newest_rec.get("question") or
+                f"{newest_rec.get('homeTeam', '')} vs {newest_rec.get('awayTeam', '')}"
             )[:80]
-            result["sample_slug"] = m.get("_event_slug", "")
+            result["sample_slug"] = newest_rec.get("_event_slug", "")
 
     # CLOB reachability
     try:
@@ -1079,11 +1105,10 @@ async def test_connectivity() -> dict:
         result["clob_status"] = f"{type(e).__name__}: {str(e)[:60]}"
         result["clob_ok"] = False
 
-    # CLOB price test using first cached token
+    # CLOB price test using first token from freshly-fetched records
     if result["clob_ok"] and result.get("ok"):
         test_token: Optional[str] = None
-        cached = _cache.get("markets") or []
-        for rec in cached:
+        for rec in records:  # use local records — _cache["markets"] may be stale or empty
             tok = json.loads(rec.get("clobTokenIds") or "[]")
             if tok:
                 test_token = tok[0]

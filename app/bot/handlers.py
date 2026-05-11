@@ -426,14 +426,37 @@ async def cmd_polytest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         n_markets = diag.get("markets_found", 0)
         n_events  = diag.get("events_scanned", 0)
         if n_markets > 0:
-            status_line = f"Gamma API: OK — {n_markets} H2H match markets ({n_events} events scanned)"
+            atp_c = diag.get("atp_count", 0)
+            wta_c = diag.get("wta_count", 0)
+            status_line = f"Gamma API: OK — {n_markets} H2H match markets ({n_events} events scanned, ATP:{atp_c} WTA:{wta_c})"
         else:
             status_line = f"Gamma API: reachable, {n_events} events but 0 H2H matches found"
         sample_parts = []
+        def _slug_date(s: str) -> str:
+            parts = s.rsplit("-", 3)
+            return "-".join(parts[-3:]) if len(parts) >= 4 else s
+        if diag.get("oldest_slug") and diag.get("newest_slug"):
+            oldest_date = _slug_date(diag["oldest_slug"])
+            newest_date = _slug_date(diag["newest_slug"])
+            sample_parts.append(f"Date range: {oldest_date} → {newest_date}")
+        month_dist = diag.get("month_dist", {})
+        current_month = diag.get("current_month", "")
+        current_count = diag.get("current_month_count", 0)
+        if current_month:
+            if current_count > 0:
+                sample_parts.append(f"Current month ({current_month}): {current_count} H2H markets ✓")
+            else:
+                sample_parts.append(f"Current month ({current_month}): 0 markets — Polymarket has no live H2H markets for current tournament")
+        if month_dist:
+            dist_str = "  ".join(f"{m}: {c}" for m, c in month_dist.items())
+            sample_parts.append(f"By month: {dist_str}")
         if diag.get("sample_question"):
-            sample_parts.append(f"Sample: \"{diag['sample_question']}\"")
+            sample_parts.append(f"Newest: \"{diag['sample_question']}\"")
         if diag.get("sample_slug"):
             sample_parts.append(f"Slug: {diag['sample_slug']}")
+        recent = diag.get("recent_slugs", [])
+        if recent:
+            sample_parts.append("Recent slugs:\n  " + "\n  ".join(recent[-5:]))
         sample_line = "\n".join(sample_parts)
     else:
         status_line = f"Gamma API: BLOCKED — HTTP {diag['http_status']}"
