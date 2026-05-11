@@ -23,6 +23,7 @@ IP blocking:
 from __future__ import annotations
 import json
 import logging
+import re
 import time
 from typing import Optional
 
@@ -350,14 +351,94 @@ async def fetch_last_trade_prices(token_ids: list[str]) -> dict[str, float]:
 
 # ---------------------------------------------------------------------------
 # Gamma API market discovery
+#
+# How Polymarket structures tennis (verified by reverse-engineering an existing
+# working bot at github.com/GastonDeMichele/Polymarket-Sports-Bot):
+#
+#   - tag_id=864 covers BOTH ATP and WTA tennis events (and tournament-winner
+#     markets, which we MUST exclude).
+#
+#   - Match events have slugs like:
+#         atp-{home_code}-{away_code}-...-YYYY-MM-DD
+#         wta-{home_code}-{away_code}-...-YYYY-MM-DD
+#     where home_code/away_code are short last-name fragments.
+#
+#   - Tournament-winner events have different slugs (e.g.
+#     "2026-australian-open-champion") — they don't match the above pattern.
+#
+#   - Per-player moneyline markets live inside an event:
+#         event.markets[].sportsMarketType === "moneyline"
+#     and each market's own slug ends with the player's code.
+#
+# So the right discovery is:
+#   1. List events with tag_id=864 (paginated up to ~500)
+#   2. Filter to slugs matching the tour-prefix + date-suffix pattern
+#   3. For each, build a unified match-record from its moneyline markets
 # ---------------------------------------------------------------------------
+
+# Match-event slug pattern: starts with atp-/wta-, ends with -YYYY-MM-DD
+_MATCH_SLUG_RE = re.compile(r"^(atp|wta)-[a-z0-9].*-\d{4}-\d{2}-\d{2}$", re.IGNORECASE)
+
+# Slug suffixes used by Polymarket for non-headline markets we never want
+_EXCLUDED_SLUG_FRAGMENTS = (
+    "-more-markets",
+    "-halftime",
+    "-exact-score",
+    "-first-half",
+    "-anytime",
+    "-set-betting",
+    "-correct-score",
+)
+
+
+def _is_match_event_slug(slug: str) -> bool:
+    """True only for head-to-head match event slugs, not tournament-winner slugs."""
+    if not slug or not _MATCH_SLUG_RE.match(slug):
+        return False
+    return not any(frag in slug for frag in _EXCLUDED_SLUG_FRAGMENTS)
+
+
+def _parse_match_codes(slug: str) -> Optional[tuple[str, str, str]]:
+    """
+    Parse 'atp-nava-navone-2025-05-10' into ('atp', 'nava', 'navone').
+    Returns None for non-match slugs.
+    """
+    if not _is_match_event_slug(slug):
+        return None
+    parts = slug.split("-")
+    # parts: [tour, home_code, away_code, ..., YYYY, MM, DD]
+    if len(parts) < 5:
+        return None
+    tour = parts[0].lower()
+    if tour not in ("atp", "wta"):
+        return None
+    home_code = parts[1]
+    away_code = parts[2]
+    if not home_code or not away_code:
+        return None
+    return (tour, home_code.lower(), away_code.lower())
+
 
 async def _fetch_event_by_slug(slug: str) -> Optional[dict]:
     """
-    Fetch a single event by slug — slug-based fetches return fully populated markets[].
-    The bulk /events?tag_id= query returns events with empty markets[], so we
-    re-fetch each event individually to get the actual market data.
+    Fetch a single event by slug using the REST-style endpoint:
+      GET /events/slug/{slug}
+    Returns the event object directly (not a list).  Falls back to ?slug= form
+    if the REST form 404s, since some Polymarket deployments differ.
     """
+    try:
+        async with _client() as c:
+            resp = await c.get(_gamma_url(f"/events/slug/{slug}"))
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, dict) and data.get("slug"):
+                    return data
+                if isinstance(data, list) and data:
+                    return data[0]
+    except Exception as e:
+        logger.debug(f"REST slug fetch failed for {slug}: {e}")
+
+    # Fallback: legacy ?slug= filter form
     try:
         async with _client() as c:
             resp = await c.get(_gamma_url("/events"), params={"slug": slug})
@@ -366,158 +447,217 @@ async def _fetch_event_by_slug(slug: str) -> Optional[dict]:
         events = data if isinstance(data, list) else data.get("data", [])
         return events[0] if events else None
     except Exception as e:
-        logger.debug(f"slug fetch failed for {slug}: {e}")
+        logger.debug(f"legacy slug fetch failed for {slug}: {e}")
         return None
 
 
-def _flatten_markets(events: list[dict]) -> list[dict]:
-    """Flatten event list into individual match markets, attaching _event_slug."""
-    markets: list[dict] = []
-    for event in events:
-        event_slug = event.get("slug", "")
-        for item in event.get("markets", []):
-            item = dict(item)
-            item["_event_slug"] = event_slug
-            if not item.get("question") and (item.get("homeTeam") or item.get("awayTeam")):
-                item["question"] = f"{item.get('homeTeam', '')} vs {item.get('awayTeam', '')}"
-            if _is_match_market(item):
-                markets.append(item)
-    return markets
-
-
-async def _fetch_events_with_params(extra_params: dict, limit: int) -> list[dict]:
+def _build_match_record(event: dict) -> Optional[dict]:
     """
-    Core helper: fetch Gamma /events with given filter params, return flat match-market list.
-    Handles the empty-markets slug re-fetch pattern automatically.
+    Build a unified head-to-head match record from a Gamma event.
+    Returns a dict with the same shape the rest of the codebase expects
+    (homeTeam/awayTeam/clobTokenIds/outcomes/conditionId), or None if this
+    event isn't a recognisable H2H match.
     """
-    import asyncio as _asyncio
+    slug = event.get("slug", "")
+    parsed = _parse_match_codes(slug)
+    if not parsed:
+        return None
+    tour, home_code, away_code = parsed
 
-    params: dict = {"active": "true", "closed": "false", "limit": limit, **extra_params}
-    label = str(extra_params)
+    raw_markets = event.get("markets") or []
+    if not raw_markets:
+        return None
 
-    try:
-        async with _client() as c:
-            resp = await c.get(_gamma_url("/events"), params=params)
-            resp.raise_for_status()
-            data = resp.json()
-    except httpx.HTTPStatusError as e:
-        _cache["last_error"] = f"Gamma HTTP {e.response.status_code}: {e.response.text[:60]}"
-        logger.warning(f"Polymarket /events {label} HTTP {e.response.status_code}")
-        return []
-    except Exception as e:
-        _cache["last_error"] = f"Gamma {type(e).__name__}: {e}"
-        logger.warning(f"Polymarket /events {label} error: {e}")
-        return []
+    # Per-player moneyline markets ("Will X win this match?")
+    moneyline = [
+        m for m in raw_markets
+        if m.get("sportsMarketType") == "moneyline"
+        and m.get("slug")
+        and "-draw" not in (m.get("slug") or "")
+    ]
 
-    events = data if isinstance(data, list) else data.get("data", [])
-    if not events:
-        logger.debug(f"Polymarket /events {label}: 0 events returned")
-        return []
-
-    # Fast path: inline markets already populated
-    if any(e.get("markets") for e in events):
-        markets = _flatten_markets(events)
-        logger.debug(f"Polymarket {label}: {len(events)} events, inline markets → {len(markets)} match markets")
-        return markets
-
-    # Slow path: bulk response has empty markets[] — re-fetch each event by slug
-    slugs = [e["slug"] for e in events if e.get("slug")]
-    if not slugs:
-        logger.warning(f"Polymarket {label}: events returned but none have slugs")
-        return []
-
-    logger.info(
-        f"Polymarket {label}: {len(events)} events, markets[] empty — "
-        f"re-fetching {len(slugs)} by slug"
-    )
-    fetched = await _asyncio.gather(*[_fetch_event_by_slug(s) for s in slugs])
-    full_events = [e for e in fetched if e is not None]
-    markets = _flatten_markets(full_events)
-    logger.info(
-        f"Polymarket {label} slug re-fetch: {len(full_events)}/{len(slugs)} events "
-        f"→ {len(markets)} match markets"
-    )
-    return markets
-
-
-async def _search_events_by_player(player_name: str) -> list[dict]:
-    """
-    Search for events containing a player's last name — fallback when tag-based
-    discovery fails.  Uses /events?q={name} text search against Gamma API.
-    """
-    import asyncio as _asyncio
-
-    last = _last_name(player_name)
-    if not last or len(last) < 3:
-        return []
-    try:
-        async with _client() as c:
-            resp = await c.get(
-                _gamma_url("/events"),
-                params={"q": last, "limit": 10, "active": "true", "closed": "false"},
+    # Two-market layout: separate moneyline market per player
+    if len(moneyline) >= 2:
+        home_m = next((m for m in moneyline if (m.get("slug") or "").endswith(f"-{home_code}")), None)
+        away_m = next((m for m in moneyline if (m.get("slug") or "").endswith(f"-{away_code}")), None)
+        if not home_m or not away_m:
+            # Fallback: use the two highest-volume markets (rare API edge case)
+            ranked = sorted(
+                moneyline,
+                key=lambda m: float(m.get("volumeNum") or m.get("volume") or 0),
+                reverse=True,
             )
-            resp.raise_for_status()
-            data = resp.json()
-        events = data if isinstance(data, list) else data.get("data", [])
+            home_m = ranked[0] if ranked else None
+            away_m = ranked[1] if len(ranked) > 1 else None
+            if not home_m or not away_m:
+                return None
+        home_tokens = _extract_token_ids(home_m)
+        away_tokens = _extract_token_ids(away_m)
+        if not home_tokens or not away_tokens:
+            return None
+
+        home_name = (home_m.get("groupItemTitle") or "").strip() or home_code.upper()
+        away_name = (away_m.get("groupItemTitle") or "").strip() or away_code.upper()
+
+        return {
+            "_event_slug": slug,
+            "_match_record": True,
+            "_combined": False,
+            "tour": tour.upper(),
+            "homeTeam": home_name,
+            "awayTeam": away_name,
+            "homeCode": home_code,
+            "awayCode": away_code,
+            "question": event.get("title") or f"{home_name} vs {away_name}",
+            "outcomes": json.dumps([home_name, away_name]),
+            # First token in clobTokenIds is the YES-token for home; second is YES-token for away.
+            # _find_player1_idx will use homeTeam/awayTeam to pick the right index.
+            "clobTokenIds": json.dumps([home_tokens[0], away_tokens[0]]),
+            # conditionId: per-player markets have separate condition IDs.
+            # Store the home one as primary and stash both for reference.
+            "conditionId": home_m.get("conditionId"),
+            "_homeConditionId": home_m.get("conditionId"),
+            "_awayConditionId": away_m.get("conditionId"),
+            "marketSlug": home_m.get("slug"),
+        }
+
+    # Single-market layout: one moneyline market with two outcomes (older API shape)
+    if len(moneyline) == 1:
+        m = moneyline[0]
+        tokens = _extract_token_ids(m)
+        if len(tokens) < 2:
+            return None
+        outcomes_raw = m.get("outcomes") or "[]"
+        try:
+            outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else list(outcomes_raw)
+        except Exception:
+            outcomes = []
+        home_name = (str(outcomes[0]).strip() if outcomes else home_code.upper())
+        away_name = (str(outcomes[1]).strip() if len(outcomes) > 1 else away_code.upper())
+
+        return {
+            "_event_slug": slug,
+            "_match_record": True,
+            "_combined": True,
+            "tour": tour.upper(),
+            "homeTeam": home_name,
+            "awayTeam": away_name,
+            "homeCode": home_code,
+            "awayCode": away_code,
+            "question": event.get("title") or f"{home_name} vs {away_name}",
+            "outcomes": json.dumps([home_name, away_name]),
+            "clobTokenIds": json.dumps([tokens[0], tokens[1]]),
+            "conditionId": m.get("conditionId"),
+            "marketSlug": m.get("slug"),
+        }
+
+    return None
+
+
+def _flatten_markets(events: list[dict]) -> list[dict]:
+    """Convert event list to head-to-head match records, dropping non-matches."""
+    out: list[dict] = []
+    for event in events:
+        rec = _build_match_record(event)
+        if rec:
+            out.append(rec)
+    return out
+
+
+async def _fetch_tennis_match_events() -> list[dict]:
+    """
+    Fetch all active tennis HEAD-TO-HEAD match events from Polymarket.
+
+    Key design decisions (informed by reverse-engineering a working Polymarket
+    tennis bot):
+
+    1. Paginate through up to 500 events (5 × 100) sorted by start_date asc.
+       The 343-market test showed many events exist; we want all of them.
+
+    2. Filter by slug pattern BEFORE fetching full market detail.
+       Match events:     atp-{home}-{away}-...-YYYY-MM-DD
+       Tournament events: 2025-australian-open-champion, etc.
+       Only slugs matching the tour-prefix + date-suffix pattern are match events.
+
+    3. For events whose markets[] is empty in the bulk response, fetch the full
+       event via GET /events/slug/{slug} (REST path, not ?slug= query param).
+    """
+    import asyncio as _asyncio
+
+    all_events: dict[str, dict] = {}   # slug → event (dedup)
+
+    for offset in range(0, 500, 100):
+        try:
+            async with _client() as c:
+                resp = await c.get(
+                    _gamma_url("/events"),
+                    params={
+                        "tag_id": 864,
+                        "active": "true",
+                        "closed": "false",
+                        "limit": 100,
+                        "offset": offset,
+                        "order": "start_date",
+                        "ascending": "true",
+                    },
+                )
+                resp.raise_for_status()
+                batch = resp.json()
+        except httpx.HTTPStatusError as e:
+            _cache["last_error"] = f"Gamma HTTP {e.response.status_code}: {e.response.text[:60]}"
+            logger.warning(f"Polymarket /events offset={offset}: HTTP {e.response.status_code}")
+            break
+        except Exception as e:
+            _cache["last_error"] = f"Gamma {type(e).__name__}: {e}"
+            logger.warning(f"Polymarket /events offset={offset}: {e}")
+            break
+
+        events = batch if isinstance(batch, list) else batch.get("data", [])
         if not events:
-            return []
-        # Re-fetch by slug when inline markets are empty
-        if not any(e.get("markets") for e in events):
-            slugs = [e["slug"] for e in events if e.get("slug")][:5]
-            fetched = await _asyncio.gather(*[_fetch_event_by_slug(s) for s in slugs])
-            events = [e for e in fetched if e is not None]
-        return _flatten_markets(events)
-    except Exception as e:
-        logger.debug(f"Polymarket player-name search '{last}' failed: {e}")
+            break   # past the last page
+
+        for ev in events:
+            slug = ev.get("slug", "")
+            if slug and _is_match_event_slug(slug) and slug not in all_events:
+                all_events[slug] = ev
+
+        if len(events) < 100:
+            break   # last page
+
+    if not all_events:
+        logger.warning("Polymarket: 0 match events found after paginating tag_id=864")
         return []
 
+    logger.info(f"Polymarket: {len(all_events)} match-slug events found across paginated fetch")
 
-async def _fetch_tennis_events(limit: int = 100) -> list[dict]:
-    """
-    Fetch active tennis markets using multiple discovery strategies in order:
-      1. /events?tag_id=864 — primary tennis tag
-      2. /events?tag_slug=tennis — alternative tag parameter (API v2 support)
+    # Split into events that already have market data and those that need re-fetch
+    have_markets = [e for e in all_events.values() if e.get("markets")]
+    need_fetch   = [e for e in all_events.values() if not e.get("markets")]
 
-    Each strategy applies the same inline-markets fast path / slug-re-fetch slow path.
-    """
-    # Strategy 1: tag_id=864
-    markets = await _fetch_events_with_params({"tag_id": 864}, limit)
-    if markets:
-        return markets
+    if need_fetch:
+        slugs = [e["slug"] for e in need_fetch]
+        logger.info(f"Polymarket: re-fetching {len(slugs)} events by slug for market data")
+        fetched = await _asyncio.gather(*[_fetch_event_by_slug(s) for s in slugs])
+        have_markets.extend(e for e in fetched if e and e.get("markets"))
 
-    # Strategy 2: tag_slug=tennis
-    logger.info("tag_id=864 returned no match markets — trying tag_slug=tennis")
-    markets = await _fetch_events_with_params({"tag_slug": "tennis"}, limit)
-    if markets:
-        return markets
-
-    logger.warning("All Polymarket tennis discovery strategies returned no markets")
-    return []
-
-
-def _is_match_market(market: dict) -> bool:
-    """Return True only for head-to-head match markets, not tournament winner markets."""
-    home = (market.get("homeTeam") or "").strip()
-    away = (market.get("awayTeam") or "").strip()
-    if home and away:
-        return True
-    question = (market.get("question") or market.get("title") or "").lower()
-    return " vs " in question or " v." in question or " v " in question
+    return have_markets
 
 
 async def _refresh_cache() -> list[dict]:
-    """Refresh market cache using /events?tag_id=864."""
+    """Refresh the match-record cache from Polymarket."""
     global _cache
 
-    markets = await _fetch_tennis_events(limit=100)
-    if markets:
-        logger.info(f"Polymarket cache: {len(markets)} markets (tag_id=864, /events)")
-    else:
-        logger.warning("Polymarket cache: no tennis markets found via /events?tag_id=864")
+    raw_events = await _fetch_tennis_match_events()
+    records = _flatten_markets(raw_events)
 
-    _cache["markets"] = markets
+    if records:
+        logger.info(f"Polymarket cache: {len(records)} H2H match markets from {len(raw_events)} events")
+    else:
+        logger.warning("Polymarket cache: 0 H2H match markets (check logs above for cause)")
+
+    _cache["markets"] = records
     _cache["fetched_at"] = time.time()
-    return markets
+    return records
 
 
 async def _get_cached_markets() -> list[dict]:
@@ -529,6 +669,25 @@ async def _get_cached_markets() -> list[dict]:
 # ---------------------------------------------------------------------------
 # Name matching
 # ---------------------------------------------------------------------------
+
+def _code_matches_player(code: str, player_last: str) -> bool:
+    """
+    True when a Polymarket slug code (e.g. "swiatek", "djok", "auger") matches
+    a player's normalized last name.  Handles both full and prefix codes.
+    """
+    if not code or not player_last:
+        return False
+    # Exact match
+    if code == player_last:
+        return True
+    # Slug code is a prefix of the full last name (e.g. "auger" → "auger-aliassime")
+    if len(code) >= 4 and player_last.startswith(code):
+        return True
+    # Full last name is a prefix of the code (rare — "djokovic" → code "djokovic")
+    if len(player_last) >= 4 and code.startswith(player_last):
+        return True
+    return False
+
 
 def _player_score(text: str, name: str) -> float:
     """Score 0–1 for how well a single player name appears in text."""
@@ -543,73 +702,69 @@ def _player_score(text: str, name: str) -> float:
     return 0.0
 
 
-def _name_score(question_norm: str, p1: str, p2: str) -> float:
-    """Score 0–2: how well both player names appear in the question."""
-    return _player_score(question_norm, p1) + _player_score(question_norm, p2)
-
-
 async def search_tennis_markets(player1: str, player2: str) -> list[dict]:
     """
-    Find the Polymarket market for this matchup by searching the cached markets.
-    Returns candidates sorted by name-match score.
+    Find the Polymarket H2H market for this matchup from the cached match records.
 
-    BOTH players must appear in the market text — this prevents linking a
-    tournament-winner market (or a different match that shares one player name)
-    to the wrong live match.
+    Matching strategy (two tiers):
+      1. Slug-code match — parse home/away codes from the event slug and check
+         whether each player's last name matches each code.  This is the most
+         reliable method since slug codes are derived from player surnames.
+      2. Name-text fallback — score each record's homeTeam/awayTeam/question
+         text against both player names; require both to score > 0.
 
-    When the tag-based cache is empty (API unreachable or no active events),
-    falls back to a direct player-name text search against the Gamma API.
+    Returns records sorted best-first.
     """
-    all_markets = await _get_cached_markets()
-
-    # Direct player-name search fallback when tag-based discovery found nothing
-    if not all_markets:
-        logger.info(
-            f"Polymarket cache empty — trying direct player search "
-            f"for {player1} vs {player2}"
-        )
-        for player in [player1, player2]:
-            extra = await _search_events_by_player(player)
-            if extra:
-                all_markets = extra
-                break
-
-    if not all_markets:
+    all_records = await _get_cached_markets()
+    if not all_records:
+        logger.warning(f"Polymarket cache empty for {player1} vs {player2}")
         return []
 
-    scored = []
-    for market in all_markets:
-        # Use homeTeam/awayTeam directly when available (more reliable than parsing question)
-        home = _normalize(market.get("homeTeam") or "")
-        away = _normalize(market.get("awayTeam") or "")
-        question = _normalize(market.get("question", "") or market.get("title", ""))
+    last1 = _last_name(player1)
+    last2 = _last_name(player2)
 
-        combined = f"{home} {away}" if (home and away) else question
+    slug_matches: list[dict] = []
+    text_scored: list[tuple[float, dict]] = []
 
+    for rec in all_records:
+        home_code = rec.get("homeCode", "")
+        away_code = rec.get("awayCode", "")
+
+        # --- Tier 1: slug-code match ---
+        p1_home = _code_matches_player(home_code, last1)
+        p1_away = _code_matches_player(away_code, last1)
+        p2_home = _code_matches_player(home_code, last2)
+        p2_away = _code_matches_player(away_code, last2)
+
+        if (p1_home and p2_away) or (p1_away and p2_home):
+            slug_matches.append(rec)
+            continue
+
+        # --- Tier 2: text scoring on homeTeam/awayTeam/question ---
+        combined = _normalize(
+            f"{rec.get('homeTeam', '')} {rec.get('awayTeam', '')} {rec.get('question', '')}"
+        )
         s1 = _player_score(combined, player1)
         s2 = _player_score(combined, player2)
-
-        # Require BOTH players to have at least a partial match.
-        # A score of 0 for either player means this is the wrong market
-        # (tournament winner, or a different match that shares one player).
         if s1 > 0 and s2 > 0:
-            scored.append((s1 + s2, market))
+            text_scored.append((s1 + s2, rec))
 
-    scored.sort(key=lambda x: x[0], reverse=True)
+    text_scored.sort(key=lambda x: x[0], reverse=True)
+    results = slug_matches + [r for _, r in text_scored]
 
-    if scored:
-        best = scored[0][1]
+    if results:
         logger.info(
-            f"Polymarket found [{scored[0][0]:.1f}] {player1} vs {player2}: "
-            f"'{best.get('question', best.get('title', ''))[:80]}'"
+            f"Polymarket found {len(results)} market(s) for {player1} vs {player2} "
+            f"(slug={len(slug_matches)}, text={len(text_scored)}): "
+            f"slug={results[0].get('_event_slug', '')}"
         )
     else:
-        logger.debug(
-            f"Polymarket: no match for {player1} vs {player2} "
-            f"in {len(all_markets)} cached markets"
+        logger.info(
+            f"Polymarket: no market for {player1} vs {player2} "
+            f"in {len(all_records)} cached H2H records"
         )
 
-    return [m for _, m in scored]
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -888,48 +1043,33 @@ async def test_connectivity() -> dict:
         "endpoint": _gamma_url("/events"),
     }
 
-    # Test Gamma API — try tag_id=864 first, fall back to tag_slug=tennis.
-    # Uses the same slug re-fetch logic as the live cache.
-    discovery_strategy: Optional[str] = None
+    # Quick HTTP probe (1 page, no slug re-fetch)
     try:
-        # Quick probe: just check HTTP status with tag_id=864
         async with _client(timeout=15.0) as c:
             resp = await c.get(
                 _gamma_url("/events"),
                 params={"tag_id": 864, "active": "true", "closed": "false", "limit": 5},
             )
             result["http_status"] = resp.status_code
-            if resp.status_code == 200:
-                result["ok"] = True
+            result["ok"] = resp.status_code == 200
     except Exception as e:
         result["http_status"] = f"{type(e).__name__}: {e}"
 
-    # If HTTP is reachable, run full market discovery using the same helper as production
+    # Full H2H discovery (same logic as live cache refresh — first 2 pages only for speed)
     if result.get("ok"):
-        markets_864 = await _fetch_events_with_params({"tag_id": 864}, limit=5)
-        if markets_864:
-            discovery_strategy = "tag_id=864"
-            result["markets_found"] = len(markets_864)
-            m = markets_864[0]
+        raw_events = await _fetch_tennis_match_events()
+        records = _flatten_markets(raw_events)
+        result["markets_found"] = len(records)
+        result["events_scanned"] = len(raw_events)
+        if records:
+            m = records[0]
             result["sample_question"] = (
                 m.get("question") or
-                f"{m.get('homeTeam','')} vs {m.get('awayTeam','')}"
+                f"{m.get('homeTeam', '')} vs {m.get('awayTeam', '')}"
             )[:80]
-        else:
-            # Fallback strategy: tag_slug=tennis
-            markets_slug = await _fetch_events_with_params({"tag_slug": "tennis"}, limit=5)
-            if markets_slug:
-                discovery_strategy = "tag_slug=tennis"
-                result["markets_found"] = len(markets_slug)
-                m = markets_slug[0]
-                result["sample_question"] = (
-                    m.get("question") or
-                    f"{m.get('homeTeam','')} vs {m.get('awayTeam','')}"
-                )[:80]
+            result["sample_slug"] = m.get("_event_slug", "")
 
-        result["discovery_strategy"] = discovery_strategy or "none worked"
-
-    # Test CLOB API reachability
+    # CLOB reachability
     try:
         async with _client(timeout=10.0) as c:
             resp = await c.get(_clob_url("/markets"), params={"limit": 1})
@@ -939,56 +1079,15 @@ async def test_connectivity() -> dict:
         result["clob_status"] = f"{type(e).__name__}: {str(e)[:60]}"
         result["clob_ok"] = False
 
-    # Test CLOB price fetch — find a real token from the discovery above
+    # CLOB price test using first cached token
     if result["clob_ok"] and result.get("ok"):
         test_token: Optional[str] = None
-        try:
-            # Reuse whatever strategy worked for discovery
-            params_to_try = (
-                [{"tag_id": 864}, {"tag_slug": "tennis"}]
-                if discovery_strategy != "tag_slug=tennis"
-                else [{"tag_slug": "tennis"}, {"tag_id": 864}]
-            )
-            for params in params_to_try:
-                async with _client(timeout=12.0) as c:
-                    resp2 = await c.get(
-                        _gamma_url("/events"),
-                        params={"active": "true", "closed": "false", "limit": 3, **params},
-                    )
-                    if resp2.status_code == 200:
-                        events2 = resp2.json()
-                        if isinstance(events2, dict):
-                            events2 = events2.get("data", [])
-                        # Gather tokens from inline markets
-                        for ev2 in events2:
-                            for mkt in ev2.get("markets", []):
-                                tokens = _extract_token_ids(mkt)
-                                if tokens:
-                                    test_token = tokens[0]
-                                    break
-                            if test_token:
-                                break
-                        # Slug re-fetch if inline markets are empty
-                        if not test_token and events2:
-                            import asyncio as _aio2
-                            slugs2 = [e["slug"] for e in events2 if e.get("slug")][:2]
-                            fetched2 = await _aio2.gather(
-                                *[_fetch_event_by_slug(s) for s in slugs2]
-                            )
-                            for ev2f in fetched2:
-                                if not ev2f:
-                                    continue
-                                for mkt in ev2f.get("markets", []):
-                                    tokens = _extract_token_ids(mkt)
-                                    if tokens:
-                                        test_token = tokens[0]
-                                        break
-                                if test_token:
-                                    break
-                if test_token:
-                    break
-        except Exception:
-            pass
+        cached = _cache.get("markets") or []
+        for rec in cached:
+            tok = json.loads(rec.get("clobTokenIds") or "[]")
+            if tok:
+                test_token = tok[0]
+                break
 
         if not test_token:
             result["clob_price_ok"] = None

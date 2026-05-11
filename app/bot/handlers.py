@@ -423,13 +423,18 @@ async def cmd_polytest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         clob_line = "CLOB: reachable (no token to test prices)"
 
     if diag["ok"]:
-        strategy = diag.get("discovery_strategy", "")
-        strategy_tag = f" [{strategy}]" if strategy and strategy != "none worked" else ""
-        if diag["markets_found"] > 0:
-            status_line = f"Gamma API: OK — {diag['markets_found']} tennis markets{strategy_tag}"
+        n_markets = diag.get("markets_found", 0)
+        n_events  = diag.get("events_scanned", 0)
+        if n_markets > 0:
+            status_line = f"Gamma API: OK — {n_markets} H2H match markets ({n_events} events scanned)"
         else:
-            status_line = f"Gamma API: reachable but 0 tennis markets{strategy_tag} (tag may have changed)"
-        sample_line = f"Sample: \"{diag['sample_question']}\"" if diag["sample_question"] else ""
+            status_line = f"Gamma API: reachable, {n_events} events but 0 H2H matches found"
+        sample_parts = []
+        if diag.get("sample_question"):
+            sample_parts.append(f"Sample: \"{diag['sample_question']}\"")
+        if diag.get("sample_slug"):
+            sample_parts.append(f"Slug: {diag['sample_slug']}")
+        sample_line = "\n".join(sample_parts)
     else:
         status_line = f"Gamma API: BLOCKED — HTTP {diag['http_status']}"
         sample_line = (
