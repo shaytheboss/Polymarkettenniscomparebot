@@ -110,9 +110,69 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def _live_compute_probs(match) -> dict:
+    """Compute model probabilities for a Match in real time.
+    Returns dict with table/markov/consensus + elo_band, for use when no
+    snapshot has been written yet by the background analyzer."""
+    from app.engine.calculator import calculate, MatchState
+    from app.engine.tables import elo_band as get_elo_band
+
+    p1 = match.player1
+    p2 = match.player2
+    p1_elo = float(match.p1_elo_at_match or (p1.current_elo if p1 else 0) or 1500)
+    p2_elo = float(match.p2_elo_at_match or (p2.current_elo if p2 else 0) or 1500)
+
+    swapped = p2_elo > p1_elo
+    if swapped:
+        a_name, b_name = p2.name, p1.name
+        a_elo, b_elo   = p2_elo, p1_elo
+        a_sets, b_sets = match.p2_sets or 0, match.p1_sets or 0
+        a_g, b_g       = match.p2_games or 0, match.p1_games or 0
+        a_p, b_p       = match.p2_pts or 0, match.p1_pts or 0
+        srv = 1 - (match.server or 0)
+    else:
+        a_name, b_name = p1.name, p2.name
+        a_elo, b_elo   = p1_elo, p2_elo
+        a_sets, b_sets = match.p1_sets or 0, match.p2_sets or 0
+        a_g, b_g       = match.p1_games or 0, match.p2_games or 0
+        a_p, b_p       = match.p1_pts or 0, match.p2_pts or 0
+        srv = match.server or 0
+
+    state = MatchState(
+        player1_name=a_name, player2_name=b_name,
+        player1_elo=a_elo, player2_elo=b_elo,
+        tour=match.tour, surface=match.surface,
+        p1_sets=a_sets, p2_sets=b_sets,
+        p1_games=a_g, p2_games=b_g,
+        p1_pts=a_p, p2_pts=b_p,
+        server=srv, in_tiebreak=bool(match.in_tiebreak),
+    )
+    result = calculate(state=state, polymarket_price=None, min_edge_pp=5.0)
+    band = get_elo_band(abs(p1_elo - p2_elo))
+    if swapped:
+        return {
+            "table":     1.0 - result.table_model.p1_win_prob,
+            "markov":    1.0 - result.markov_model.p1_win_prob,
+            "consensus": 1.0 - result.consensus_prob,
+            "elo_band":  band,
+            "notes":     result.table_model.notes or "",
+        }
+    return {
+        "table":     result.table_model.p1_win_prob,
+        "markov":    result.markov_model.p1_win_prob,
+        "consensus": result.consensus_prob,
+        "elo_band":  band,
+        "notes":     result.table_model.notes or "",
+    }
+
+
 async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     from sqlalchemy.orm import selectinload
-    from app.collectors.polymarket import fetch_market_meta
+    from app.collectors.polymarket import (
+        fetch_market_meta, search_tennis_markets, _extract_token_ids,
+        _find_player1_idx, fetch_clob_prices,
+    )
+    import json as _json
 
     async with AsyncSessionLocal() as db:
         result = await db.execute(
@@ -140,32 +200,72 @@ async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
         last_snap = match.snapshots[-1] if match.snapshots else None
 
-        # Use snapshot probabilities when available; fall back to 50/50 for freshly-
-        # discovered matches that haven't been computed yet.
-        if last_snap:
+        # Use snapshot probabilities when available; otherwise compute inline so
+        # /live always shows the real model output (not a 50/50 placeholder).
+        if last_snap and last_snap.consensus_prob_p1 is not None:
             table_prob     = last_snap.table_prob_p1 or 0.5
             markov_prob    = last_snap.markov_prob_p1 or 0.5
-            consensus_prob = last_snap.consensus_prob_p1 or 0.5
-            snap_poly      = last_snap.poly_price_p1
+            consensus_prob = last_snap.consensus_prob_p1
             elo_band       = last_snap.raw_data.get("elo_band", "?") if last_snap.raw_data else "?"
             table_notes    = last_snap.raw_data.get("table_notes", "") if last_snap.raw_data else ""
         else:
-            table_prob = markov_prob = consensus_prob = 0.5
-            snap_poly   = None
-            elo_band    = "?"
-            table_notes = ""
+            try:
+                probs = _live_compute_probs(match)
+                table_prob     = probs["table"]
+                markov_prob    = probs["markov"]
+                consensus_prob = probs["consensus"]
+                elo_band       = probs["elo_band"]
+                table_notes    = probs["notes"]
+            except Exception as e:
+                logger.warning(f"Inline prob compute failed for match {match.id}: {e}")
+                table_prob = markov_prob = consensus_prob = 0.5
+                elo_band = "?"
+                table_notes = ""
 
-        # Prefer snapshot poly price; fall back to match-level last known price.
-        poly_price = snap_poly if snap_poly is not None else match.last_poly_price_p1
+        # Resolve Polymarket link: prefer what the background job stored, but if
+        # nothing is linked yet, search the cache in real time so the user sees
+        # the URL/price immediately on first /live call.
+        slug = match.polymarket_slug
+        cid  = match.polymarket_condition_id
+        token_id = match.polymarket_token_id
+        poly_price = match.last_poly_price_p1
+
+        if not cid and not slug:
+            try:
+                found = await search_tennis_markets(p1.name, p2.name)
+            except Exception as e:
+                logger.warning(f"live search failed for match {match.id}: {e}")
+                found = []
+            if found:
+                best = found[0]
+                slug = best.get("_event_slug") or best.get("slug")
+                cid  = best.get("conditionId") or best.get("condition_id")
+                idx  = _find_player1_idx(best, p1.name, p2.name)
+                token_ids = _extract_token_ids(best)
+                if len(token_ids) > idx:
+                    token_id = token_ids[idx]
+                # Try CLOB for a real-time price; fall back to Gamma outcomePrices.
+                if token_id:
+                    try:
+                        prices, _ok = await fetch_clob_prices([token_id])
+                        if token_id in prices:
+                            poly_price = prices[token_id]
+                    except Exception as e:
+                        logger.debug(f"live CLOB fetch failed: {e}")
+                if poly_price is None:
+                    op_raw = best.get("outcomePrices") or "[]"
+                    try:
+                        op = _json.loads(op_raw) if isinstance(op_raw, str) else op_raw
+                        if isinstance(op, list) and len(op) > idx:
+                            poly_price = float(op[idx])
+                    except Exception:
+                        pass
 
         # Fetch live Polymarket metadata (URL/volume/last-trade) if we have a link.
         meta = {}
-        if match.polymarket_condition_id or match.polymarket_slug:
+        if cid or slug:
             try:
-                meta = await fetch_market_meta(
-                    condition_id=match.polymarket_condition_id,
-                    slug=match.polymarket_slug,
-                )
+                meta = await fetch_market_meta(condition_id=cid, slug=slug)
             except Exception as e:
                 logger.warning(f"polymarket meta fetch failed for match {match.id}: {e}")
                 meta = {}
@@ -187,8 +287,8 @@ async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             table_notes=table_notes,
             last_trade_p1=meta.get("last_trade_p1"),
             last_trade_p2=meta.get("last_trade_p2"),
-            poly_slug=match.polymarket_slug or meta.get("slug"),
-            poly_condition_id=match.polymarket_condition_id or meta.get("condition_id"),
+            poly_slug=slug or meta.get("slug"),
+            poly_condition_id=cid or meta.get("condition_id"),
             poly_volume_24h=meta.get("volume_24h"),
         )
         try:
