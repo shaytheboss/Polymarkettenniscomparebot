@@ -111,18 +111,26 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    from sqlalchemy.orm import selectinload
+    from app.collectors.polymarket import fetch_market_meta
+
     async with AsyncSessionLocal() as db:
         result = await db.execute(
-            select(Match).where(Match.status == "live")
-            .order_by(Match.updated_at.desc()).limit(8)
+            select(Match)
+            .options(
+                selectinload(Match.player1),
+                selectinload(Match.player2),
+                selectinload(Match.snapshots),
+            )
+            .where(Match.status == "live")
+            .order_by(Match.updated_at.desc())
+            .limit(8)
         )
         matches = result.scalars().all()
 
     if not matches:
         await update.message.reply_text("No live matches right now\\.", parse_mode="MarkdownV2")
         return
-
-    from app.collectors.polymarket import fetch_market_meta
 
     for match in matches:
         p1 = match.player1
@@ -131,8 +139,24 @@ async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             continue
 
         last_snap = match.snapshots[-1] if match.snapshots else None
-        if not last_snap:
-            continue
+
+        # Use snapshot probabilities when available; fall back to 50/50 for freshly-
+        # discovered matches that haven't been computed yet.
+        if last_snap:
+            table_prob     = last_snap.table_prob_p1 or 0.5
+            markov_prob    = last_snap.markov_prob_p1 or 0.5
+            consensus_prob = last_snap.consensus_prob_p1 or 0.5
+            snap_poly      = last_snap.poly_price_p1
+            elo_band       = last_snap.raw_data.get("elo_band", "?") if last_snap.raw_data else "?"
+            table_notes    = last_snap.raw_data.get("table_notes", "") if last_snap.raw_data else ""
+        else:
+            table_prob = markov_prob = consensus_prob = 0.5
+            snap_poly   = None
+            elo_band    = "?"
+            table_notes = ""
+
+        # Prefer snapshot poly price; fall back to match-level last known price.
+        poly_price = snap_poly if snap_poly is not None else match.last_poly_price_p1
 
         # Fetch live Polymarket metadata (URL/volume/last-trade) if we have a link.
         meta = {}
@@ -153,14 +177,14 @@ async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             p2_name=p2.name,
             p1_elo=match.p1_elo_at_match or p1.current_elo or 1500,
             p2_elo=match.p2_elo_at_match or p2.current_elo or 1500,
-            table_prob_p1=last_snap.table_prob_p1 or 0.5,
-            markov_prob_p1=last_snap.markov_prob_p1 or 0.5,
-            consensus_prob_p1=last_snap.consensus_prob_p1 or 0.5,
-            poly_price_p1=last_snap.poly_price_p1,
-            elo_band=last_snap.raw_data.get("elo_band", "?") if last_snap.raw_data else "?",
+            table_prob_p1=table_prob,
+            markov_prob_p1=markov_prob,
+            consensus_prob_p1=consensus_prob,
+            poly_price_p1=poly_price,
+            elo_band=elo_band,
             surface=match.surface,
             tour=match.tour,
-            table_notes=last_snap.raw_data.get("table_notes", "") if last_snap.raw_data else "",
+            table_notes=table_notes,
             last_trade_p1=meta.get("last_trade_p1"),
             last_trade_p2=meta.get("last_trade_p2"),
             poly_slug=match.polymarket_slug or meta.get("slug"),
