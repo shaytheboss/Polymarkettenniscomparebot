@@ -491,17 +491,23 @@ async def cmd_polytest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         live = result.scalars().all()
 
+    # Show sample ATP slugs so we can verify the slug format
+    atp_slugs = diag.get("atp_slugs_sample", [])
+    if atp_slugs:
+        lines.append("\nATP slugs (sample):\n  " + "\n  ".join(atp_slugs[:10]))
+
     if live:
-        lines.append("\nLive matches:")
+        from app.collectors.polymarket import search_tennis_markets
+        lines.append("\nLive matches (live search):")
         for m in live:
             p1 = m.player1.name if m.player1 else "?"
             p2 = m.player2.name if m.player2 else "?"
-            poly_status = (
-                f"linked {m.last_poly_price_p1*100:.0f}%"
-                if m.last_poly_price_p1 is not None
-                else ("linked (no price yet)" if m.polymarket_condition_id else "not found")
-            )
-            lines.append(f"  {p1} vs {p2} -> {poly_status}")
+            found = await search_tennis_markets(p1, p2)
+            if found:
+                slug = found[0].get("_event_slug", "?")
+                lines.append(f"  {p1} vs {p2} -> FOUND: {slug}")
+            else:
+                lines.append(f"  {p1} vs {p2} -> not found")
 
     await update.message.reply_text("\n".join(lines))
 
