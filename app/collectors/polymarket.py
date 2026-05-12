@@ -379,6 +379,14 @@ async def fetch_last_trade_prices(token_ids: list[str]) -> dict[str, float]:
 # Match-event slug pattern: starts with atp-/wta-, ends with -YYYY-MM-DD
 _MATCH_SLUG_RE = re.compile(r"^(atp|wta)-[a-z0-9].*-\d{4}-\d{2}-\d{2}$", re.IGNORECASE)
 
+# Individual-market slug pattern (per-player moneyline). Each H2H event has 2
+# such markets, e.g. "atp-bublik-darderi-2026-05-12-bublik" and "...-darderi".
+# Stripping the trailing "-{player_code}" yields the parent event slug.
+_MARKET_SLUG_RE = re.compile(
+    r"^(atp|wta)-[a-z0-9].*-\d{4}-\d{2}-\d{2}-[a-z][a-z0-9-]*$",
+    re.IGNORECASE,
+)
+
 # Slug suffixes used by Polymarket for non-headline markets we never want
 _EXCLUDED_SLUG_FRAGMENTS = (
     "-more-markets",
@@ -564,6 +572,90 @@ def _flatten_markets(events: list[dict]) -> list[dict]:
     return out
 
 
+async def _fetch_tennis_via_markets_api(max_pages: int = 30) -> list[dict]:
+    """
+    Alternative discovery path: scan /markets?active=true&closed=false (paginated)
+    and reconstruct H2H event dicts by grouping individual-player markets that
+    share a parent event slug.
+
+    Catches matches that /events?tag_id=864 misses (e.g., not yet tagged).
+    Returns event-like dicts compatible with _build_match_record.
+    """
+    raw_markets: list[dict] = []
+    for offset in range(0, max_pages * 100, 100):
+        try:
+            async with _client() as c:
+                resp = await c.get(
+                    _gamma_url("/markets"),
+                    params={
+                        "active": "true",
+                        "closed": "false",
+                        "limit": 100,
+                        "offset": offset,
+                    },
+                )
+                resp.raise_for_status()
+                batch = resp.json()
+        except httpx.HTTPStatusError as e:
+            logger.warning(f"Polymarket /markets offset={offset}: HTTP {e.response.status_code}")
+            break
+        except Exception as e:
+            logger.warning(f"Polymarket /markets offset={offset}: {e}")
+            break
+
+        markets = batch if isinstance(batch, list) else batch.get("data", [])
+        if not markets:
+            break
+
+        for m in markets:
+            slug = m.get("slug", "")
+            if not slug or not _MARKET_SLUG_RE.match(slug):
+                continue
+            if any(frag in slug for frag in _EXCLUDED_SLUG_FRAGMENTS):
+                continue
+            raw_markets.append(m)
+
+        if len(markets) < 100:
+            break   # last page
+
+    if not raw_markets:
+        logger.info("Polymarket /markets: 0 tennis-pattern markets")
+        return []
+
+    # Group markets by parent event slug (strip the trailing "-{player_code}")
+    grouped: dict[str, list[dict]] = {}
+    for m in raw_markets:
+        slug = m.get("slug", "")
+        parent_slug = slug.rsplit("-", 1)[0]
+        if _MATCH_SLUG_RE.match(parent_slug):
+            grouped.setdefault(parent_slug, []).append(m)
+
+    events: list[dict] = []
+    for parent_slug, mkts in grouped.items():
+        if len(mkts) < 2:
+            continue   # H2H needs both players' markets present
+        # Make sure they look like moneylines (not draws/side bets)
+        ml = [
+            m for m in mkts
+            if m.get("sportsMarketType") in (None, "moneyline")
+            and "-draw" not in (m.get("slug") or "")
+        ]
+        if len(ml) < 2:
+            continue
+        events.append({
+            "slug": parent_slug,
+            "title": ml[0].get("eventTitle") or "",
+            "markets": ml,
+            "startDate": ml[0].get("startDate") or ml[0].get("startDateIso") or "",
+        })
+
+    logger.info(
+        f"Polymarket /markets: {len(raw_markets)} tennis-pattern markets → "
+        f"{len(events)} H2H events grouped"
+    )
+    return events
+
+
 async def _fetch_tennis_match_events() -> list[dict]:
     """
     Fetch all active tennis HEAD-TO-HEAD match events from Polymarket.
@@ -624,11 +716,32 @@ async def _fetch_tennis_match_events() -> list[dict]:
         if len(events) < 100:
             break   # last page
 
-    if not all_events:
-        logger.warning("Polymarket: 0 match events found after paginating tag_id=864")
-        return []
+    tag_count = len(all_events)
+    logger.info(f"Polymarket: {tag_count} match-slug events from /events?tag_id=864")
 
-    logger.info(f"Polymarket: {len(all_events)} match-slug events found across paginated fetch")
+    # SECOND DISCOVERY PATH — /markets endpoint (catches untagged events).
+    # Merged here so search_tennis_markets sees BOTH sources.
+    try:
+        extra_events = await _fetch_tennis_via_markets_api()
+    except Exception as e:
+        logger.warning(f"Polymarket /markets discovery failed: {e}")
+        extra_events = []
+
+    added_from_markets = 0
+    for ev in extra_events:
+        slug = ev.get("slug", "")
+        if slug and slug not in all_events:
+            all_events[slug] = ev
+            added_from_markets += 1
+    if added_from_markets:
+        logger.info(
+            f"Polymarket /markets added {added_from_markets} extra events "
+            f"(now {len(all_events)} total)"
+        )
+
+    if not all_events:
+        logger.warning("Polymarket: 0 match events found (both /events and /markets returned empty)")
+        return []
 
     # Split into events that already have market data and those that need re-fetch
     have_markets = [e for e in all_events.values() if e.get("markets")]
@@ -706,15 +819,16 @@ async def search_tennis_markets(player1: str, player2: str) -> list[dict]:
     """
     Find the Polymarket H2H market for this matchup from the cached match records.
 
-    Matching strategy (two tiers):
+    Matching strategy (three tiers, evaluated in order):
       1. Slug-code match — parse home/away codes from the event slug and check
-         whether each player's last name matches each code.  This is the most
-         reliable method since slug codes are derived from player surnames.
-      2. Name-text fallback — score each record's homeTeam/awayTeam/question
-         text against both player names; require both to score > 0.
+         whether each player's last name matches each code.
+      2. Name-text scoring — substring check on homeTeam/awayTeam/question.
+      3. Fuzzy match (name_matcher) — last resort for partial/abbreviated names.
 
     Returns records sorted best-first.
     """
+    from app.utils.name_matcher import match_name
+
     all_records = await _get_cached_markets()
     if not all_records:
         logger.warning(f"Polymarket cache empty for {player1} vs {player2}")
@@ -725,8 +839,11 @@ async def search_tennis_markets(player1: str, player2: str) -> list[dict]:
 
     slug_matches: list[dict] = []
     text_scored: list[tuple[float, dict]] = []
+    fuzzy_scored: list[tuple[float, dict]] = []
+    consumed: set[str] = set()   # event slugs already matched (dedup)
 
     for rec in all_records:
+        ev_slug = rec.get("_event_slug", "")
         home_code = rec.get("homeCode", "")
         away_code = rec.get("awayCode", "")
 
@@ -738,6 +855,7 @@ async def search_tennis_markets(player1: str, player2: str) -> list[dict]:
 
         if (p1_home and p2_away) or (p1_away and p2_home):
             slug_matches.append(rec)
+            consumed.add(ev_slug)
             continue
 
         # --- Tier 2: text scoring on homeTeam/awayTeam/question ---
@@ -748,20 +866,43 @@ async def search_tennis_markets(player1: str, player2: str) -> list[dict]:
         s2 = _player_score(combined, player2)
         if s1 > 0 and s2 > 0:
             text_scored.append((s1 + s2, rec))
+            consumed.add(ev_slug)
+
+    # --- Tier 3: fuzzy match — pairs each search player against (homeTeam, awayTeam) ---
+    # Only evaluated if tiers 1 and 2 missed.
+    remaining = [r for r in all_records if r.get("_event_slug", "") not in consumed]
+    if remaining:
+        for rec in remaining:
+            home_team = rec.get("homeTeam", "")
+            away_team = rec.get("awayTeam", "")
+            if not home_team or not away_team:
+                continue
+            # Each side fuzzy-matches independently against player1 / player2
+            p1_to_home = match_name(player1, [home_team], threshold=0.75) is not None
+            p1_to_away = match_name(player1, [away_team], threshold=0.75) is not None
+            p2_to_home = match_name(player2, [home_team], threshold=0.75) is not None
+            p2_to_away = match_name(player2, [away_team], threshold=0.75) is not None
+            if (p1_to_home and p2_to_away) or (p1_to_away and p2_to_home):
+                fuzzy_scored.append((0.5, rec))
 
     text_scored.sort(key=lambda x: x[0], reverse=True)
-    results = slug_matches + [r for _, r in text_scored]
+    results = (
+        slug_matches
+        + [r for _, r in text_scored]
+        + [r for _, r in fuzzy_scored]
+    )
 
     if results:
         logger.info(
             f"Polymarket found {len(results)} market(s) for {player1} vs {player2} "
-            f"(slug={len(slug_matches)}, text={len(text_scored)}): "
-            f"slug={results[0].get('_event_slug', '')}"
+            f"(slug={len(slug_matches)}, text={len(text_scored)}, "
+            f"fuzzy={len(fuzzy_scored)}): slug={results[0].get('_event_slug', '')}"
         )
     else:
         logger.info(
             f"Polymarket: no market for {player1} vs {player2} "
-            f"in {len(all_records)} cached H2H records"
+            f"in {len(all_records)} cached H2H records "
+            f"(last1='{last1}', last2='{last2}')"
         )
 
     return results
@@ -913,6 +1054,93 @@ async def fetch_price_by_condition_id(
         return None
 
 
+async def fetch_market_meta(
+    condition_id: Optional[str] = None,
+    slug: Optional[str] = None,
+) -> dict:
+    """
+    Fetch metadata (volume_24h, last-trade prices) for a market.
+
+    Looks up by condition_id (preferred) or slug.  Returns:
+      {
+        "volume_24h": float | None,
+        "volume_total": float | None,
+        "last_trade_p1": float | None,   # last trade price of outcome[0]
+        "last_trade_p2": float | None,
+        "yes_price_p1": float | None,    # current Gamma outcomePrices[0]
+        "yes_price_p2": float | None,
+        "slug": str,
+        "condition_id": str,
+        "question": str,
+      }
+    """
+    out: dict = {
+        "volume_24h": None, "volume_total": None,
+        "last_trade_p1": None, "last_trade_p2": None,
+        "yes_price_p1": None, "yes_price_p2": None,
+        "slug": slug or "", "condition_id": condition_id or "",
+        "question": "",
+    }
+    if not condition_id and not slug:
+        return out
+
+    try:
+        async with _client() as c:
+            params = {"condition_id": condition_id} if condition_id else {"slug": slug}
+            resp = await c.get(_gamma_url("/markets"), params=params)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        logger.warning(f"fetch_market_meta {condition_id or slug}: {e}")
+        return out
+
+    market = data[0] if isinstance(data, list) and data else (data or {})
+    if not market:
+        return out
+
+    out["slug"] = market.get("slug") or out["slug"]
+    out["condition_id"] = market.get("conditionId") or out["condition_id"]
+    out["question"] = market.get("question") or ""
+
+    try:
+        out["volume_24h"] = float(market.get("volume24hr") or 0)
+    except Exception:
+        pass
+    try:
+        out["volume_total"] = float(market.get("volume") or 0)
+    except Exception:
+        pass
+
+    # Yes prices via outcomePrices
+    op_raw = market.get("outcomePrices")
+    try:
+        op = json.loads(op_raw) if isinstance(op_raw, str) else op_raw
+    except Exception:
+        op = None
+    if isinstance(op, list):
+        try:
+            if len(op) >= 1:
+                out["yes_price_p1"] = float(op[0])
+            if len(op) >= 2:
+                out["yes_price_p2"] = float(op[1])
+        except Exception:
+            pass
+
+    # Last trade prices via CLOB token ids
+    token_ids = _extract_token_ids(market)
+    if token_ids:
+        try:
+            prices = await fetch_last_trade_prices(token_ids[:2])
+            if len(token_ids) >= 1 and token_ids[0] in prices:
+                out["last_trade_p1"] = prices[token_ids[0]]
+            if len(token_ids) >= 2 and token_ids[1] in prices:
+                out["last_trade_p2"] = prices[token_ids[1]]
+        except Exception as e:
+            logger.debug(f"fetch_market_meta last_trade: {e}")
+
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Main entry point — fetch price for a match
 # ---------------------------------------------------------------------------
@@ -1055,7 +1283,16 @@ async def test_connectivity() -> dict:
     except Exception as e:
         result["http_status"] = f"{type(e).__name__}: {e}"
 
-    # Full H2H discovery (same logic as live cache refresh)
+    # Diagnostic probe of the new /markets path on its own (count only)
+    if result.get("ok"):
+        try:
+            markets_path_events = await _fetch_tennis_via_markets_api()
+            result["markets_path_events"] = len(markets_path_events)
+        except Exception as e:
+            result["markets_path_events"] = -1
+            result["markets_path_error"] = str(e)[:80]
+
+    # Full H2H discovery (combined /events + /markets, same logic as live cache refresh)
     records: list[dict] = []
     if result.get("ok"):
         raw_events = await _fetch_tennis_match_events()
