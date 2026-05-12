@@ -1085,6 +1085,13 @@ async def test_connectivity() -> dict:
             result["current_month_count"] = month_counter.get(current_month, 0)
             result["atp_count"] = sum(1 for r in records if r.get("tour", "").upper() == "ATP")
             result["wta_count"] = sum(1 for r in records if r.get("tour", "").upper() == "WTA")
+            # Slug samples — sorted so date-ordered within tour
+            result["atp_slugs_sample"] = sorted(s for s in all_slugs if s.startswith("atp-"))[:20]
+            result["wta_slugs_sample"] = sorted(s for s in all_slugs if s.startswith("wta-"))[:10]
+
+            # Pre-populate the cache so handlers can call search_tennis_markets() immediately
+            _cache["markets"] = records
+            _cache["fetched_at"] = time.time()
 
             newest_rec = next(
                 (r for r in records if r.get("_event_slug") == newest_slug), records[-1]
