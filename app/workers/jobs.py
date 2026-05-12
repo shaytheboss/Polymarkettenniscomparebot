@@ -742,9 +742,10 @@ async def job_run_analyzer():
 
         for match in matches:
             try:
-                if match.last_poly_price_p1 is None:
-                    continue
-
+                # Run process_live_match even when Polymarket price is missing —
+                # it still creates a snapshot with model probabilities so /live
+                # can show real numbers.  Opportunity detection inside the
+                # function already guards on poly_price being non-None.
                 new_opps, updated_opps, _calc = await process_live_match(match, db)
 
                 # Snapshot ids + edge values before commit (ORM objects expire after commit)
