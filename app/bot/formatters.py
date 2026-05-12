@@ -166,23 +166,61 @@ def fmt_match_prob(
     tour: str,
     table_notes: str = "",
     last_trade_p1: Optional[float] = None,
+    last_trade_p2: Optional[float] = None,
+    poly_slug: Optional[str] = None,
+    poly_condition_id: Optional[str] = None,
+    poly_volume_24h: Optional[float] = None,
 ) -> str:
     elo_gap = p1_elo - p2_elo
     surface_emoji = {"hard": "🔵", "clay": "🟤", "grass": "🟢"}.get(surface, "⚫")
     p1_short = p1_name.split()[-1]
+    p2_short = p2_name.split()[-1]
 
     if poly_price_p1 is not None:
         ref = last_trade_p1 if last_trade_p1 is not None else poly_price_p1
         edge = (consensus_prob_p1 - ref) * 100
         edge_emoji = "🔥" if abs(edge) >= 8 else ("⚡" if abs(edge) >= 5 else "")
         price_label = "ask" if last_trade_p1 is not None else "mid"
+        # Per-player yes prices: p2 = 1 - p1 in a binary market
+        yes_p1 = poly_price_p1
+        yes_p2 = 1.0 - poly_price_p1
+        lt2 = last_trade_p2 if last_trade_p2 is not None else (
+            (1.0 - last_trade_p1) if last_trade_p1 is not None else None
+        )
+        last_line = (
+            f"  Last trade: `{_esc(p1_short)}={last_trade_p1*100:.1f}% `\\| "
+            f"`{_esc(p2_short)}={lt2*100:.1f}%`\n"
+            if last_trade_p1 is not None and lt2 is not None else ""
+        )
+        vol_line = (
+            f"  Volume \\(24h\\): `${poly_volume_24h:,.0f}`\n"
+            if poly_volume_24h is not None and poly_volume_24h > 0 else ""
+        )
+        # URL + condition id always last (they're long and noisy)
+        url_line = ""
+        if poly_slug:
+            poly_url = f"https://polymarket.com/event/{poly_slug}"
+            url_line = f"  🔗 [Open market]({_esc(poly_url)})\n"
+        cid_line = (
+            f"  Condition: `{_esc(poly_condition_id[:14])}…`\n"
+            if poly_condition_id and len(poly_condition_id) > 14 else
+            (f"  Condition: `{_esc(poly_condition_id)}`\n" if poly_condition_id else "")
+        )
         poly_section = (
             f"📉 *Polymarket*\n"
-            f"  Price \\({price_label}\\): `{ref*100:.1f}%`\n"
-            f"  Edge: `{edge:+.1f}pp` {edge_emoji}"
-        )
+            f"  Yes price \\({price_label}\\): `{_esc(p1_short)}={yes_p1*100:.1f}% `\\| "
+            f"`{_esc(p2_short)}={yes_p2*100:.1f}%`\n"
+            f"{last_line}"
+            f"{vol_line}"
+            f"  Edge \\({_esc(p1_short)}\\): `{edge:+.1f}pp` {edge_emoji}\n"
+            f"{url_line}"
+            f"{cid_line}"
+        ).rstrip()
     else:
         poly_section = "📉 *Polymarket*\n  Not linked yet"
+        if poly_slug:
+            poly_url = f"https://polymarket.com/event/{poly_slug}"
+            poly_section += f"\n  🔗 [Open market]({_esc(poly_url)})"
 
     return (
         f"🎾 *{_esc(match_name)}*\n"

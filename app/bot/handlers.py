@@ -122,6 +122,8 @@ async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("No live matches right now\\.", parse_mode="MarkdownV2")
         return
 
+    from app.collectors.polymarket import fetch_market_meta
+
     for match in matches:
         p1 = match.player1
         p2 = match.player2
@@ -131,6 +133,18 @@ async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         last_snap = match.snapshots[-1] if match.snapshots else None
         if not last_snap:
             continue
+
+        # Fetch live Polymarket metadata (URL/volume/last-trade) if we have a link.
+        meta = {}
+        if match.polymarket_condition_id or match.polymarket_slug:
+            try:
+                meta = await fetch_market_meta(
+                    condition_id=match.polymarket_condition_id,
+                    slug=match.polymarket_slug,
+                )
+            except Exception as e:
+                logger.warning(f"polymarket meta fetch failed for match {match.id}: {e}")
+                meta = {}
 
         text = fmt_match_prob(
             match_name=f"{p1.name} vs {p2.name}",
@@ -147,9 +161,14 @@ async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             surface=match.surface,
             tour=match.tour,
             table_notes=last_snap.raw_data.get("table_notes", "") if last_snap.raw_data else "",
+            last_trade_p1=meta.get("last_trade_p1"),
+            last_trade_p2=meta.get("last_trade_p2"),
+            poly_slug=match.polymarket_slug or meta.get("slug"),
+            poly_condition_id=match.polymarket_condition_id or meta.get("condition_id"),
+            poly_volume_24h=meta.get("volume_24h"),
         )
         try:
-            await update.message.reply_text(text, parse_mode="MarkdownV2")
+            await update.message.reply_text(text, parse_mode="MarkdownV2", disable_web_page_preview=True)
         except Exception as e:
             logger.error(f"Failed to send live match message: {e}")
 
@@ -425,12 +444,20 @@ async def cmd_polytest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if diag["ok"]:
         n_markets = diag.get("markets_found", 0)
         n_events  = diag.get("events_scanned", 0)
+        n_mkts_path = diag.get("markets_path_events", 0)
         if n_markets > 0:
             atp_c = diag.get("atp_count", 0)
             wta_c = diag.get("wta_count", 0)
-            status_line = f"Gamma API: OK — {n_markets} H2H match markets ({n_events} events scanned, ATP:{atp_c} WTA:{wta_c})"
+            status_line = (
+                f"Gamma API: OK — {n_markets} H2H match markets ({n_events} events scanned, "
+                f"ATP:{atp_c} WTA:{wta_c})\n"
+                f"  Discovery: /events?tag_id=864 + /markets fallback ({n_mkts_path} events from /markets)"
+            )
         else:
-            status_line = f"Gamma API: reachable, {n_events} events but 0 H2H matches found"
+            status_line = (
+                f"Gamma API: reachable, {n_events} events but 0 H2H matches found\n"
+                f"  /markets fallback returned {n_mkts_path} events"
+            )
         sample_parts = []
         def _slug_date(s: str) -> str:
             parts = s.rsplit("-", 3)
